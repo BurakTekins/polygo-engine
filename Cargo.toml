@@ -5,20 +5,39 @@ edition = "2021"
 
 [dependencies]
 # Async runtime engine (highly optimized, multithreaded worker pool)
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 
 # High-performance WebSocket stream library for low-latency networking
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.21.0", features = ["native-tls"] }
 
-# Zero-copy capable JSON parsing frameworks
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# Asynchronous stream utilities required for split reading and writing loops
+futures-util = "0.3.32"
 
-# TLS support for secure and fast WebSockets
-native-tls = "0.2"
+# Zero-copy capable JSON serialization and deserialization frameworks
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# High-performance event tracking and low-overhead microsecond logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+
+# Asynchronous HTTP client for fast REST API communications (fetching market data, balances)
+reqwest = { version = "0.11.27", features = ["json"] }
+
+# Idiomatic and flexible error handling pattern to eliminate nested boilerplate
+anyhow = "1.0.102"
+
+# Local environment configuration loader for secure API credentials management
+dotenv = "0.15.0"
+
+# Fast URL parsing layer required for secure WebSocket endpoint verification
+url = "2"
+
 
 [profile.release]
 opt-level = 3        # Enable maximum optimizations for high-frequency trading execution
 lto = true           # Link-Time Optimization across all crates to eliminate function call overhead
 codegen-units = 1    # Reduce parallel compilation units to maximize single-binary optimization
 panic = "abort"      # Strip panic stack-unwinding code to drastically reduce binary size and increase speed
+strip = true         # Automatically strip debug symbols and testing logs from the final executable binary
