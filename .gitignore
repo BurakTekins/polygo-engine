@@ -1,0 +1,23 @@
+# --- Rust Compiler Output ---
+# Contains compiled binaries, artifacts, and dependency intermediate files
+/target/
+
+# --- Cargo Lockfile ---
+# For binaries, keeping Cargo.lock is okay, but if you want to regenerate 
+# or keep the root repository pristine, you can track it or ignore it.
+# We keep it tracked for consistency in binary deployments, but target is always hidden.
+
+# --- IDE Artifacts ---
+# JetBrains / RustRover local configuration directories
+.idea/
+*.iml
+
+# VS Code local workspace states
+.vscode/
+
+# --- System & Log Artifacts ---
+# Local latency tracking and memory dump outputs
+*.log
+*.csv
+.DS_Store
+Thumbs.db
