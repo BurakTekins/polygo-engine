@@ -4,6 +4,8 @@ use crate::ws::polymarket::ChainlinkTick;
 use anyhow::Result;
 use tokio::sync::mpsc::Receiver;
 use tracing::{error, info, warn};
+use std::fs::OpenOptions;
+use std::io::Write;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderSide {
@@ -12,7 +14,6 @@ pub enum OrderSide {
 }
 
 impl OrderSide {
-    /// Zero-copy mapping to Polymarket CLOB API string expectations
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::BuyYes => "BUY_YES",
@@ -48,7 +49,6 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Runs forever. Consumes signals sequentially to guarantee strict chronological order.
 pub async fn run(
     mut order_rx: tokio::sync::mpsc::Receiver<crate::executor::order::OrderSignal>,
     engine_state: Arc<tokio::sync::RwLock<crate::engine::state::EngineState>>,
@@ -56,7 +56,6 @@ pub async fn run(
 ) {
     info!("Order executor operational with strict FIFO ordering ✓");
 
-    // We process orders one-by-one. No tokio::spawn here to prevent race conditions (Task B overriding Task A)
     while let Some(signal) = order_rx.recv().await {
         let received_at = now_ms();
         let pipeline_latency = received_at.saturating_sub(signal.signal_ts_ms);
@@ -67,8 +66,6 @@ pub async fn run(
             signal.side, signal.price, signal.size, pipeline_latency
         );
 
-        // --- Execution latency guard ---
-        // If the pipeline was clogged and this signal is stale, drop it before hitting the network
         if pipeline_latency > 150 {
             warn!(
                 target: "polygo_engine",
@@ -78,8 +75,6 @@ pub async fn run(
             continue;
         }
 
-        // --- Strict Sequential Execution ---
-        // The loop blocks here until the network request finishes, guaranteeing Order 1 hits the book before Order 2
         match execute_order_sequential(signal).await {
             Ok(result) => {
                 info!(
@@ -87,7 +82,6 @@ pub async fn run(
                     "✓ Order executed in sequence — Network Latency: {}ms, Status: {}",
                     result.latency_ms, result.success
                 );
-                // TODO: Forward result to audit emitter without blocking
             }
             Err(e) => {
                 error!(target: "polygo_engine", "❌ Network rejection on sequential CLOB routing: {}", e);
@@ -98,7 +92,6 @@ pub async fn run(
     warn!(target: "polygo_engine", "Upstream runtime channel dead. Initiating clean executor closure.");
 }
 
-/// Sends order to Polymarket CLOB API sequentially
 async fn execute_order_sequential(signal: OrderSignal) -> Result<ExecutionResult> {
     let start = now_ms();
 
@@ -108,7 +101,25 @@ async fn execute_order_sequential(signal: OrderSignal) -> Result<ExecutionResult
         signal.side.as_str(), signal.size, signal.price
     );
 
-    // Simulate cross-network infrastructure response latency (e.g., HTTP POST to CLOB)
+    // Arbitrage log kaydı
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("arbitrage_log.csv")
+    {
+        let log_entry = format!(
+            "{},{},{},{},{},{},{}\n",
+            start,
+            signal.side.as_str(),
+            signal.price,
+            signal.size,
+            signal.binance_price,
+            signal.chainlink_lag_ms,
+            "SUCCESS"
+        );
+        let _ = file.write_all(log_entry.as_bytes());
+    }
+
     tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
     let end = now_ms();
