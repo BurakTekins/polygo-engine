@@ -2,6 +2,8 @@ use std::sync::Arc;
 use crate::executor::order::{OrderSignal, OrderSide};
 use crate::ws::binance::PriceTick;
 use crate::ws::polymarket::ChainlinkTick;
+use std::fs::OpenOptions;
+use std::io::Write;
 use anyhow::Result;
 use tokio::sync::{mpsc::Sender, watch::Receiver};
 use tracing::{debug, info, warn};
@@ -29,6 +31,17 @@ pub async fn run(
     engine_state: Arc<tokio::sync::RwLock<crate::engine::state::EngineState>>,
 ) -> Result<()> {
     info!("Decision engine started ✓");
+    let mut csv = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("opportunities.csv")?;
+
+    if csv.metadata()?.len() == 0 {
+        writeln!(
+            csv,
+            "timestamp,binance_price,price_move,direction,chainlink_lag_ms,edge"
+        )?;
+    }
 
     let mut last_binance_price: Option<f64> = None;
 
@@ -48,7 +61,7 @@ pub async fn run(
         let now = now_ms();
 
         // --- Guard 1: Stale data check ---
-        let signal_age_ms = now.saturating_sub(binance_tick.trade_time_ms);
+        let signal_age_ms = now.saturating_sub(binance_tick.local_ts_ms);
         if signal_age_ms > MAX_SIGNAL_AGE_MS {
             warn!(target: "polygo_engine", "Stale Binance tick: {}ms > {}ms, skipping", signal_age_ms, MAX_SIGNAL_AGE_MS);
             continue;
@@ -72,7 +85,6 @@ pub async fn run(
         // Significant momentum detected
         let direction_up = !binance_tick.is_buyer_maker;
         info!(target: "polygo_engine", "Signal detected! Move: ${:.2}, Direction: {}", price_move, if direction_up { "UP ↑" } else { "DOWN ↓" });
-
         // --- Guard 3: Chainlink lag check ---
         // Scope-gate the Chainlink read lock to release the watch channel immediately
         let chainlink_tick = {
@@ -81,7 +93,7 @@ pub async fn run(
         }; // Chainlink read lock dropped right here!
 
         let chainlink_lag_ms = match chainlink_tick {
-            Some(cl) => now.saturating_sub(cl.chainlink_ts_ms),
+            Some(cl) => now.saturating_sub(cl.local_ts_ms),
             None => {
                 warn!(target: "polygo_engine", "No Chainlink data synchronized yet, dropping signal");
                 last_binance_price = Some(binance_tick.price);
@@ -97,8 +109,8 @@ pub async fn run(
 
         // --- Guard 4: Edge calculation ---
         // TODO: Integrate raw live orderbook depth here
-        let clob_ask_price: f64 = 0.50;
-        let expected_clob_price: f64 = if direction_up { 0.55 } else { 0.45 };
+        let clob_ask_price = chainlink_tick.best_ask;
+        let clob_bid_price = chainlink_tick.best_bid;
         let edge = (expected_clob_price - clob_ask_price).abs();
 
         if edge < MIN_EDGE_CENTS {
@@ -118,7 +130,18 @@ pub async fn run(
         };
 
         info!(target: "polygo_engine", "⚡ Arbitrage edge confirmed! Dispatching order → {:?}", signal);
+        let direction = if direction_up { "UP" } else { "DOWN" };
 
+        let _ = writeln!(
+            csv,
+            "{},{:.2},{:.2},{},{},{}",
+            now,
+            binance_tick.price,
+            price_move,
+            direction,
+            chainlink_lag_ms,
+            edge
+        );
         // Bounded channel send — if the executor hangs, we fast-fail to prevent bad trades
         if order_tx.send(signal).await.is_err() {
             warn!(target: "polygo_engine", "Order execution channel fractured. Emergency halt.");
