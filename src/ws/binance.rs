@@ -1,129 +1,83 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tokio::sync::watch::Sender;
+use tokio::sync::mpsc::Sender;
 use tokio_tungstenite::connect_async;
 use tracing::{error, info, warn};
 
+use crate::health::HealthState;
+use crate::market::now_ms;
+
 const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade";
 
-// Debug mode: forward every price change
-const MIN_PRICE_MOVE: f64 = 0.0;
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[derive(Debug, Deserialize)]
-pub struct BinanceTick {
+struct BinanceTick {
     #[serde(rename = "T")]
-    pub trade_time: u64,
-
+    trade_time_ms: u64,
     #[serde(rename = "p")]
-    pub price: String,
-
-    #[serde(rename = "q")]
-    pub quantity: String,
-
-    #[serde(rename = "m")]
-    pub is_buyer_maker: bool,
+    price: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PriceTick {
     pub price: f64,
     pub trade_time_ms: u64,
-    pub local_ts_ms: u64,
-    pub is_buyer_maker: bool,
 }
 
-pub async fn run(tx: Sender<Option<PriceTick>>) -> Result<()> {
-    loop {
-        info!("Connecting to Binance WS...");
+impl PriceTick {
+    pub fn new(price: f64, trade_time_ms: u64) -> Self {
+        Self {
+            price,
+            trade_time_ms,
+        }
+    }
+}
 
+#[inline]
+pub fn parse_message(raw: &str) -> Result<PriceTick> {
+    let tick: BinanceTick = serde_json::from_str(raw)?;
+    Ok(PriceTick::new(tick.price.parse()?, tick.trade_time_ms))
+}
+
+pub async fn run(tx: Sender<PriceTick>, health: Arc<HealthState>) -> Result<()> {
+    loop {
+        info!("Connecting to Binance aggTrade stream");
         match connect_async(BINANCE_WS_URL).await {
             Ok((ws_stream, _)) => {
-                info!("Binance WS connected ✓");
-
+                info!("Binance aggTrade stream connected");
                 let (_, mut read) = ws_stream.split();
-
-                while let Some(msg) = read.next().await {
-                    match msg {
-                        Ok(msg) if msg.is_text() => {
-                            let text = match msg.into_text() {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    warn!("Failed to decode text frame: {}", e);
+                while let Some(message) = read.next().await {
+                    match message {
+                        Ok(message) if message.is_text() => {
+                            let raw = message.into_text()?;
+                            let tick = match parse_message(&raw) {
+                                Ok(tick) => tick,
+                                Err(error) => {
+                                    warn!(%error, "Invalid Binance aggTrade payload");
                                     continue;
                                 }
                             };
-                            println!("RAW BINANCE: {}", text);
-
-                            let tick: BinanceTick =
-                                match serde_json::from_str(&text) {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        warn!("Failed to parse Binance tick: {}", e);
-                                        continue;
-                                    }
-                                };
-
-                            let price = match tick.price.parse::<f64>() {
-                                Ok(p) => p,
-                                Err(_) => {
-                                    warn!("Invalid price: {}", tick.price);
-                                    continue;
-                                }
-                            };
-
-                            let should_forward = {
-                                let last = tx.borrow();
-
-                                match last.as_ref() {
-                                    Some(last_tick) => {
-                                        (price - last_tick.price).abs()
-                                            >= MIN_PRICE_MOVE
-                                    }
-                                    None => true,
-                                }
-                            };
-
-                            if !should_forward {
-                                continue;
-                            }
-
-                            let parsed = PriceTick {
-                                price,
-                                trade_time_ms: tick.trade_time,
-                                local_ts_ms: now_ms(),
-                                is_buyer_maker: tick.is_buyer_maker,
-                            };
-
-                            if tx.send(Some(parsed)).is_err() {
-                                error!("Decision engine receiver dropped");
-                                return Ok(());
+                            health.mark_binance(now_ms());
+                            if tx.try_send(tick).is_err() {
+                                health.trip(2);
+                                anyhow::bail!(
+                                    "Binance event channel full or closed; refusing lossy replay"
+                                );
                             }
                         }
-
                         Ok(_) => {}
-
-                        Err(e) => {
-                            error!("Binance WS error: {}", e);
+                        Err(error) => {
+                            error!(%error, "Binance websocket error");
                             break;
                         }
                     }
                 }
             }
-
-            Err(e) => {
-                error!("Binance connection failed: {}", e);
-            }
+            Err(error) => error!(%error, "Binance websocket connection failed"),
         }
-
-        warn!("Binance disconnected, reconnecting in 1 second...");
+        warn!("Binance websocket disconnected; reconnecting in 1s");
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 }

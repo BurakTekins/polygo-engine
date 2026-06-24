@@ -1,3 +1,31 @@
 {
-  "asset_id": "61702868527958692514476109507770229535220422788868242347303881529153703776310"
+  "execution_mode": "dry_run",
+  "market": {
+    "gamma_base_url": "https://gamma-api.polymarket.com",
+    "slug_prefix": "btc-updown-5m",
+    "interval_seconds": 300,
+    "discovery_poll_ms": 1000
+  },
+  "strategy": {
+    "momentum_window_ms": 100,
+    "momentum_threshold_usd": 8.0,
+    "execution_latency_ms": 100,
+    "hold_ms": 5000,
+    "min_market_progress": 0.05,
+    "max_market_progress": 0.90,
+    "max_book_age_ms": 300
+  },
+  "risk": {
+    "max_spread": 0.02,
+    "max_notional_usd": 100.0,
+    "max_shares": 500,
+    "max_open_positions": 5,
+    "daily_loss_limit_usd": 500.0
+  },
+  "integration": {
+    "java_audit_endpoint": "http://127.0.0.1:8081/api/v1/audit-events/engine"
+  },
+  "control": {
+    "bind_addr": "127.0.0.1:8090"
+  }
 }

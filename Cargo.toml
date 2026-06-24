@@ -3,6 +3,9 @@ name = "polygo-engine"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+latency-telemetry = []
+
 [dependencies]
 # Async runtime engine (highly optimized, multithreaded worker pool)
 tokio = { version = "1.52.3", features = ["full"] }

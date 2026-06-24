@@ -1,158 +1,123 @@
-use crate::executor::order::{OrderSignal, OrderSide};
-use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::info;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-/// Represents a single open position on Polymarket CLOB
-#[derive(Debug, Clone, Copy)]
-pub struct OpenPosition {
-    pub signal: OrderSignal,
-    pub opened_at_ms: u64,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClosedPosition {
     pub entry_price: f64,
-    pub size: u64,
-    pub side: OrderSide,
+    pub exit_price: f64,
+    pub shares: u64,
+    pub gross_pnl: f64,
+    pub entry_fee: f64,
+    pub exit_fee: f64,
+    pub net_pnl: f64,
 }
 
-/// Tracks engine state — open positions, P&L, risk limits
 #[derive(Debug)]
 pub struct EngineState {
-    pub open_positions: Vec<OpenPosition>,
-    pub total_pnl_usdc: f64,
-    pub total_trades: u64,
-    pub total_wins: u64,
-    pub max_open_positions: usize,
-    pub daily_loss_limit_usdc: f64,
-    pub daily_loss_usdc: f64,
-
-    /// Fast atomic gate to allow lock-free checking down the critical path
-    pub trading_allowed: AtomicBool,
-}
-
-// Manual Default implementation to elegantly bypass AtomicBool derive limitations
-impl Default for EngineState {
-    fn default() -> Self {
-        Self {
-            open_positions: Vec::new(),
-            total_pnl_usdc: 0.0,
-            total_trades: 0,
-            total_wins: 0,
-            max_open_positions: 0,
-            daily_loss_limit_usdc: 0.0,
-            daily_loss_usdc: 0.0,
-            trading_allowed: AtomicBool::new(true),
-        }
-    }
-}
-
-#[inline(always)]
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    open_or_reserved: AtomicUsize,
+    next_position_id: AtomicU64,
+    max_open_positions: usize,
+    daily_loss_limit_microusd: u64,
+    daily_loss_microusd: AtomicU64,
+    total_pnl_microusd: AtomicI64,
+    total_trades: AtomicU64,
 }
 
 impl EngineState {
-    pub fn new(max_open_positions: usize, daily_loss_limit_usdc: f64) -> Self {
+    pub fn new(max_open_positions: usize, daily_loss_limit_usd: f64) -> Self {
         Self {
+            open_or_reserved: AtomicUsize::new(0),
+            next_position_id: AtomicU64::new(1),
             max_open_positions,
-            daily_loss_limit_usdc,
-            trading_allowed: AtomicBool::new(true),
-            ..Default::default()
+            daily_loss_limit_microusd: to_microusd(daily_loss_limit_usd),
+            daily_loss_microusd: AtomicU64::new(0),
+            total_pnl_microusd: AtomicI64::new(0),
+            total_trades: AtomicU64::new(0),
         }
     }
 
-    /// High-frequency lock-free check. Decision engine can call this inline
-    /// without awaiting or acquiring heavy OS mutex locks.
     #[inline(always)]
-    pub fn can_trade_atomic(&self) -> bool {
-        self.trading_allowed.load(Ordering::Relaxed)
-    }
-
-    /// Internal sync guard to re-evaluate structural risk boundaries
-    fn update_trading_gate(&self) {
-        let current_loss = self.daily_loss_usdc;
-        let limit = self.daily_loss_limit_usdc;
-        let open_count = self.open_positions.len();
-
-        if current_loss >= limit || open_count >= self.max_open_positions {
-            self.trading_allowed.store(false, Ordering::Release);
-        } else {
-            self.trading_allowed.store(true, Ordering::Release);
+    pub fn try_reserve(&self) -> Result<(), &'static str> {
+        if self.daily_loss_microusd.load(Ordering::Acquire) >= self.daily_loss_limit_microusd {
+            return Err("daily_loss_limit");
         }
+        self.open_or_reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < self.max_open_positions).then_some(current + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| "max_open_positions")
     }
 
-    /// Register a new open position
-    pub fn open_position(&mut self, signal: OrderSignal) {
-        let pos = OpenPosition {
-            entry_price: signal.price,
-            size: signal.size,
-            side: signal.side,
-            opened_at_ms: now_ms(),
-            signal,
-        };
-        self.open_positions.push(pos);
-        self.total_trades += 1;
-
-        info!(
-            target: "polygo_engine",
-            "Position opened — side: {:?}, size: {}, entry: {:.4} | open positions: {}",
-            signal.side, signal.size, signal.price, self.open_positions.len()
-        );
-
-        self.update_trading_gate();
+    #[inline(always)]
+    pub fn release_reservation(&self) {
+        self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// Close position by index, calculate strict Polymarket fee matrix & net P&L
-    pub fn close_position(&mut self, index: usize, exit_price: f64) {
-        if index >= self.open_positions.len() {
-            return;
-        }
+    pub fn open_reserved(&self) -> u64 {
+        self.total_trades.fetch_add(1, Ordering::Relaxed);
+        self.next_position_id.fetch_add(1, Ordering::Relaxed)
+    }
 
-        let pos = self.open_positions.remove(index);
-
-        // Polymarket dynamic CLOB fee calculation formula: 0.07 * p * (1 - p)
-        let fee = (pos.size as f64) * 0.07 * pos.entry_price * (1.0 - pos.entry_price);
-        let gross_pnl = (exit_price - pos.entry_price) * (pos.size as f64);
-        let net_pnl = gross_pnl - fee;
-
-        self.total_pnl_usdc += net_pnl;
-
+    pub fn close(&self, entry_price: f64, exit_price: f64, shares: u64) -> ClosedPosition {
+        let gross_pnl = round_5((exit_price - entry_price) * shares as f64);
+        let entry_fee = taker_fee(shares, entry_price);
+        let exit_fee = taker_fee(shares, exit_price);
+        let net_pnl = round_5(gross_pnl - entry_fee - exit_fee);
         if net_pnl < 0.0 {
-            self.daily_loss_usdc += net_pnl.abs();
-        } else {
-            self.total_wins += 1;
+            self.daily_loss_microusd
+                .fetch_add(to_microusd(net_pnl.abs()), Ordering::AcqRel);
         }
+        add_signed_microusd(&self.total_pnl_microusd, net_pnl);
+        self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+        ClosedPosition {
+            entry_price,
+            exit_price,
+            shares,
+            gross_pnl,
+            entry_fee,
+            exit_fee,
+            net_pnl,
+        }
+    }
+}
 
-        info!(
-            target: "polygo_engine",
-            "Position closed — gross: {:.2}, fee: {:.2}, net: {:.2} | total P&L: {:.2}",
-            gross_pnl, fee, net_pnl, self.total_pnl_usdc
-        );
+pub fn taker_fee(shares: u64, price: f64) -> f64 {
+    round_5(shares as f64 * 0.07 * price * (1.0 - price))
+}
 
-        self.update_trading_gate();
+pub fn round_5(value: f64) -> f64 {
+    (value * 100_000.0).round() / 100_000.0
+}
+
+fn to_microusd(value: f64) -> u64 {
+    (value * 1_000_000.0).round() as u64
+}
+
+fn add_signed_microusd(target: &AtomicI64, value: f64) {
+    let delta = (value * 1_000_000.0).round() as i64;
+    target.fetch_add(delta, Ordering::AcqRel);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_and_close_use_five_decimal_rounding() {
+        assert_eq!(taker_fee(100, 0.50), 1.75);
+        let state = EngineState::new(1, 100.0);
+        state.try_reserve().unwrap();
+        state.open_reserved();
+        let closed = state.close(0.50, 0.55, 100);
+        assert_eq!(closed.entry_fee, 1.75);
+        assert_eq!(closed.exit_fee, 1.7325);
+        assert_eq!(closed.net_pnl, 1.5175);
     }
 
-    pub fn win_rate(&self) -> f64 {
-        if self.total_trades == 0 {
-            return 0.0;
-        }
-        (self.total_wins as f64 / self.total_trades as f64) * 100.0
-    }
-
-    pub fn print_summary(&self) {
-        info!(
-            target: "polygo_engine",
-            "=== Engine State Summary ===\n\
-             Total trades : {}\n\
-             Win rate     : {:.1}%\n\
-             Total P&L    : {:.2} USDC\n\
-             Daily loss   : {:.2} USDC\n\
-             Open positions: {}",
-            self.total_trades,
-            self.win_rate(),
-            self.total_pnl_usdc,
-            self.daily_loss_usdc,
-            self.open_positions.len()
-        );
+    #[test]
+    fn atomic_reservations_enforce_position_limit() {
+        let state = EngineState::new(1, 100.0);
+        assert!(state.try_reserve().is_ok());
+        assert_eq!(state.try_reserve(), Err("max_open_positions"));
     }
 }
