@@ -16,6 +16,8 @@ pub struct JavaStrategyConfig {
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
+    pub min_price: f64,
+    pub max_price: f64,
     pub max_notional_usd: f64,
     pub max_shares: u64,
     pub up_outcome: String,
@@ -46,6 +48,14 @@ impl JavaStrategyConfig {
         if !self.max_spread.is_finite() || self.max_spread < 0.0 {
             return Err("invalid_max_spread");
         }
+        if !self.min_price.is_finite()
+            || !self.max_price.is_finite()
+            || self.min_price < 0.0
+            || self.max_price > 1.0
+            || self.min_price >= self.max_price
+        {
+            return Err("invalid_price_range");
+        }
         if self.up_outcome != "YES" || self.down_outcome != "NO" {
             return Err("invalid_outcome_mapping");
         }
@@ -63,6 +73,8 @@ pub struct StrategySnapshot {
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
+    pub min_price: f64,
+    pub max_price: f64,
     pub max_notional_usd: f64,
     pub max_shares: u64,
     pub max_book_age_ms: u64,
@@ -80,6 +92,8 @@ pub struct StrategyStore {
     min_progress: AtomicU64,
     max_progress: AtomicU64,
     max_spread: AtomicU64,
+    min_price: AtomicU64,
+    max_price: AtomicU64,
     max_notional_usd: AtomicU64,
     max_shares: AtomicU64,
     max_book_age_ms: AtomicU64,
@@ -99,6 +113,8 @@ impl StrategyStore {
             min_progress: AtomicU64::new(defaults.min_market_progress.to_bits()),
             max_progress: AtomicU64::new(defaults.max_market_progress.to_bits()),
             max_spread: AtomicU64::new(risk.max_spread.to_bits()),
+            min_price: AtomicU64::new(0.05f64.to_bits()),
+            max_price: AtomicU64::new(0.95f64.to_bits()),
             max_notional_usd: AtomicU64::new(risk.max_notional_usd.to_bits()),
             max_shares: AtomicU64::new(risk.max_shares),
             max_book_age_ms: AtomicU64::new(defaults.max_book_age_ms),
@@ -126,6 +142,10 @@ impl StrategyStore {
             .store(config.max_progress.to_bits(), Ordering::Relaxed);
         self.max_spread
             .store(config.max_spread.to_bits(), Ordering::Relaxed);
+        self.min_price
+            .store(config.min_price.to_bits(), Ordering::Relaxed);
+        self.max_price
+            .store(config.max_price.to_bits(), Ordering::Relaxed);
         self.max_notional_usd
             .store(config.max_notional_usd.to_bits(), Ordering::Relaxed);
         self.max_shares.store(config.max_shares, Ordering::Relaxed);
@@ -158,6 +178,8 @@ impl StrategyStore {
                 min_progress: f64::from_bits(self.min_progress.load(Ordering::Relaxed)),
                 max_progress: f64::from_bits(self.max_progress.load(Ordering::Relaxed)),
                 max_spread: f64::from_bits(self.max_spread.load(Ordering::Relaxed)),
+                min_price: f64::from_bits(self.min_price.load(Ordering::Relaxed)),
+                max_price: f64::from_bits(self.max_price.load(Ordering::Relaxed)),
                 max_notional_usd: f64::from_bits(self.max_notional_usd.load(Ordering::Relaxed)),
                 max_shares: self.max_shares.load(Ordering::Relaxed),
                 max_book_age_ms: self.max_book_age_ms.load(Ordering::Relaxed),
@@ -229,6 +251,8 @@ mod tests {
             min_progress: 0.05,
             max_progress: 0.9,
             max_spread: 0.02,
+            min_price: 0.05,
+            max_price: 0.95,
             max_notional_usd: 100.0,
             max_shares: 500,
             up_outcome: "YES".into(),

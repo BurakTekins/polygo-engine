@@ -178,6 +178,9 @@ pub fn revalidate_entry(
     if ask <= bid || ask - bid > config.max_spread {
         return None;
     }
+    if ask < config.min_price || ask > config.max_price {
+        return None;
+    }
     let shares = order_size(ask, config.max_notional_usd, config.max_shares);
     (shares > 0).then_some((ask, shares))
 }

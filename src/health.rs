@@ -96,9 +96,6 @@ impl HealthState {
 
     pub fn set_market_ready(&self, ready: bool) {
         self.market_ready.store(ready, Ordering::Release);
-        if !ready {
-            self.stop();
-        }
     }
 
     #[inline(always)]
