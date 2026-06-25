@@ -1,14 +1,112 @@
-use std::sync::Arc;
+use std::{env, str::FromStr, sync::Arc};
 
-use tokio::sync::mpsc;
+use alloy::signers::{
+    local::{LocalSigner, PrivateKeySigner},
+    Signer as _,
+};
+use anyhow::{Context, Result};
+use polymarket_client_sdk_v2::{
+    auth::{state::Authenticated, Credentials, Normal},
+    clob::{
+        types::{response::PostOrderResponse, Amount, OrderType, Side as ClobSide, SignatureType},
+        Client as ClobClient, Config as ClobConfig,
+    },
+    types::{Address, Decimal, U256},
+    POLYGON,
+};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use crate::config::ExecutionMode;
 use crate::emitter::audit::{AuditEmitter, AuditEvent};
 use crate::engine::state::{round_5, EngineState};
 use crate::health::HealthState;
-use crate::market::{now_ms, MarketClock};
+use crate::market::{now_ms, ActiveMarket, MarketClock};
 use crate::runtime_config::{StrategySnapshot, StrategyStore};
 use crate::ws::polymarket::{BookSnapshot, BookState, OutcomeBook};
+
+const DEFAULT_CLOB_API_URL: &str = "https://clob-v2.polymarket.com";
+
+type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
+
+#[derive(Clone)]
+pub struct LiveExecutor {
+    client: AuthenticatedClobClient,
+    signer: PrivateKeySigner,
+}
+
+impl LiveExecutor {
+    pub async fn from_env() -> Result<Self> {
+        let host = env_nonempty("POLYMARKET_CLOB_API_URL")
+            .or_else(|| env_nonempty("CLOB_API_URL"))
+            .unwrap_or_else(|| DEFAULT_CLOB_API_URL.to_owned());
+        let private_key = env_nonempty("POLYMARKET_PRIVATE_KEY")
+            .or_else(|| env_nonempty("POLYGO_PRIVATE_KEY"))
+            .context("POLYMARKET_PRIVATE_KEY is required for live execution")?;
+        let signer = LocalSigner::from_str(&private_key)
+            .context("invalid POLYMARKET_PRIVATE_KEY")?
+            .with_chain_id(Some(POLYGON));
+
+        let mut builder = ClobClient::new(&host, ClobConfig::default())
+            .context("failed to create Polymarket CLOB client")?
+            .authentication_builder(&signer);
+
+        let key = env_nonempty("POLYMARKET_API_KEY").or_else(|| env_nonempty("POLYGO_API_KEY"));
+        let secret =
+            env_nonempty("POLYMARKET_API_SECRET").or_else(|| env_nonempty("POLYGO_API_SECRET"));
+        let passphrase = env_nonempty("POLYMARKET_API_PASSPHRASE")
+            .or_else(|| env_nonempty("POLYGO_API_PASSPHRASE"));
+        if let (Some(key), Some(secret), Some(passphrase)) = (key, secret, passphrase) {
+            builder = builder.credentials(Credentials::new(
+                key.parse().context("invalid POLYMARKET_API_KEY")?,
+                secret,
+                passphrase,
+            ));
+        }
+
+        let funder = env_nonempty("POLYMARKET_FUNDER_ADDRESS")
+            .or_else(|| env_nonempty("POLYMARKET_DEPOSIT_WALLET"))
+            .or_else(|| env_nonempty("DEPOSIT_WALLET"));
+        let signature_type = parse_signature_type(
+            env_nonempty("POLYMARKET_SIGNATURE_TYPE").as_deref(),
+            funder.is_some(),
+        )?;
+        if let Some(funder) = funder {
+            builder = builder.funder(Address::from_str(&funder).context("invalid funder address")?);
+        }
+        builder = builder.signature_type(signature_type);
+
+        let client = builder
+            .authenticate()
+            .await
+            .context("Polymarket authentication failed")?;
+        Ok(Self { client, signer })
+    }
+
+    async fn buy_shares(&self, token_id: U256, shares: u64) -> Result<PostOrderResponse> {
+        self.client
+            .market_order()
+            .token_id(token_id)
+            .side(ClobSide::Buy)
+            .amount(Amount::shares(Decimal::from(shares))?)
+            .order_type(OrderType::FOK)
+            .build_sign_and_post(&self.signer)
+            .await
+            .context("Polymarket buy order failed")
+    }
+
+    async fn sell_shares(&self, token_id: U256, shares: u64) -> Result<PostOrderResponse> {
+        self.client
+            .market_order()
+            .token_id(token_id)
+            .side(ClobSide::Sell)
+            .amount(Amount::shares(Decimal::from(shares))?)
+            .order_type(OrderType::FOK)
+            .build_sign_and_post(&self.signer)
+            .await
+            .context("Polymarket sell order failed")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderSide {
@@ -60,33 +158,60 @@ impl OrderSignal {
 
 pub async fn run(
     mut order_rx: mpsc::Receiver<OrderSignal>,
+    market_rx: watch::Receiver<Option<ActiveMarket>>,
     book_state: Arc<BookState>,
     engine_state: Arc<EngineState>,
     health: Arc<HealthState>,
     market_clock: Arc<MarketClock>,
     strategy_store: Arc<StrategyStore>,
+    execution_mode: ExecutionMode,
+    live_executor: Option<LiveExecutor>,
     audit: AuditEmitter,
 ) {
-    info!("Dry-run executor started");
+    info!(mode = execution_mode.as_str(), "Executor started");
     while let Some(signal) = order_rx.recv().await {
         let _ = audit.emit(AuditEvent::signal(signal));
+        let task_market_rx = market_rx.clone();
         let task_book_state = Arc::clone(&book_state);
         let task_state = Arc::clone(&engine_state);
         let task_health = Arc::clone(&health);
         let task_clock = Arc::clone(&market_clock);
         let task_store = Arc::clone(&strategy_store);
         let task_audit = audit.clone();
+        let task_live_executor = live_executor.clone();
         tokio::spawn(async move {
-            execute_dry_run(
-                signal,
-                task_book_state,
-                task_state,
-                task_health,
-                task_clock,
-                task_store,
-                task_audit,
-            )
-            .await;
+            match execution_mode {
+                ExecutionMode::DryRun => {
+                    execute_dry_run(
+                        signal,
+                        task_book_state,
+                        task_state,
+                        task_health,
+                        task_clock,
+                        task_store,
+                        task_audit,
+                    )
+                    .await;
+                }
+                ExecutionMode::Live => {
+                    let Some(live_executor) = task_live_executor else {
+                        reject(signal, "live_executor_missing", &task_state, &task_audit);
+                        return;
+                    };
+                    execute_live(
+                        signal,
+                        task_market_rx,
+                        task_book_state,
+                        task_state,
+                        task_health,
+                        task_clock,
+                        task_store,
+                        live_executor,
+                        task_audit,
+                    )
+                    .await;
+                }
+            }
         });
     }
     warn!("Execution channel closed");
@@ -158,6 +283,162 @@ async fn execute_dry_run(
     let _ = audit.emit(AuditEvent::exit(position_id, signal.side.as_str(), closed));
 }
 
+async fn execute_live(
+    signal: OrderSignal,
+    market_rx: watch::Receiver<Option<ActiveMarket>>,
+    book_state: Arc<BookState>,
+    engine_state: Arc<EngineState>,
+    health: Arc<HealthState>,
+    market_clock: Arc<MarketClock>,
+    strategy_store: Arc<StrategyStore>,
+    live_executor: LiveExecutor,
+    audit: AuditEmitter,
+) {
+    tokio::time::sleep_until(signal.execute_at).await;
+    let executed_at_ms = now_ms();
+    if !health.is_running() {
+        reject(signal, "engine_stopped", &engine_state, &audit);
+        return;
+    }
+    let Some(config) = strategy_store.load() else {
+        reject(signal, "config_missing", &engine_state, &audit);
+        return;
+    };
+    if config.generation != signal.config_generation {
+        reject(signal, "config_changed", &engine_state, &audit);
+        return;
+    }
+    let book = book_state.load();
+    let Some((ask, shares)) =
+        revalidate_entry(book, executed_at_ms, &market_clock, &config, signal.side)
+    else {
+        reject(signal, "entry_revalidation", &engine_state, &audit);
+        return;
+    };
+    let Some(active_market) = market_rx.borrow().clone() else {
+        reject(signal, "market_missing", &engine_state, &audit);
+        return;
+    };
+    let token_id_text = match signal.side {
+        OrderSide::BuyYes => active_market.yes_asset_id,
+        OrderSide::BuyNo => active_market.no_asset_id,
+    };
+    let token_id = match U256::from_str(&token_id_text) {
+        Ok(token_id) => token_id,
+        Err(error) => {
+            warn!(%error, side = signal.side.as_str(), "Invalid Polymarket token id");
+            reject(signal, "invalid_token_id", &engine_state, &audit);
+            return;
+        }
+    };
+
+    let entry_response = match live_executor.buy_shares(token_id, shares).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, side = signal.side.as_str(), shares, "Live entry failed");
+            reject(signal, "live_entry_failed", &engine_state, &audit);
+            return;
+        }
+    };
+    if !entry_response.success {
+        warn!(
+            status = %entry_response.status,
+            error = ?entry_response.error_msg,
+            side = signal.side.as_str(),
+            shares,
+            "Live entry rejected"
+        );
+        reject(signal, "live_entry_rejected", &engine_state, &audit);
+        return;
+    }
+
+    let entry_price = buy_price(&entry_response).unwrap_or(ask);
+    let position_id = engine_state.open_reserved();
+    let _ = audit.emit(AuditEvent::LiveEntry {
+        position_id,
+        signal_ts_ms: signal.signal_ts_ms,
+        executed_at_ms,
+        latency_ms: executed_at_ms.saturating_sub(signal.signal_ts_ms),
+        side: signal.side.as_str(),
+        token_id: token_id_text.clone(),
+        order_id: entry_response.order_id.clone(),
+        order_status: entry_response.status.to_string(),
+        price: round_5(entry_price),
+        shares,
+        notional_usd: round_5(entry_price * shares as f64),
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(signal.hold_ms)).await;
+    let exit_at_ms = now_ms();
+    let book = book_state.load();
+    if exit_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_stale_book_position_open",
+        });
+        return;
+    }
+    let Some(exit_bid) = outcome_book(book, signal.side).bid else {
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_missing_bid_position_open",
+        });
+        return;
+    };
+
+    let exit_response = match live_executor.sell_shares(token_id, shares).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, side = signal.side.as_str(), shares, "Live exit failed; position may remain open");
+            health.trip(5);
+            let _ = audit.emit(AuditEvent::ExecutionRejected {
+                signal_ts_ms: signal.signal_ts_ms,
+                side: signal.side.as_str(),
+                reason: "live_exit_failed_position_open",
+            });
+            return;
+        }
+    };
+    if !exit_response.success {
+        warn!(
+            status = %exit_response.status,
+            error = ?exit_response.error_msg,
+            side = signal.side.as_str(),
+            shares,
+            "Live exit rejected; position may remain open"
+        );
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_rejected_position_open",
+        });
+        return;
+    }
+
+    let exit_price = sell_price(&exit_response).unwrap_or(exit_bid);
+    let closed = engine_state.close(entry_price, exit_price, shares);
+    let _ = audit.emit(AuditEvent::LiveExit {
+        position_id,
+        closed_at_ms: exit_at_ms,
+        side: signal.side.as_str(),
+        token_id: token_id_text,
+        order_id: exit_response.order_id.clone(),
+        order_status: exit_response.status.to_string(),
+        entry_price: round_5(entry_price),
+        exit_price: round_5(exit_price),
+        shares,
+        gross_pnl: closed.gross_pnl,
+        entry_fee: closed.entry_fee,
+        exit_fee: closed.exit_fee,
+        net_pnl: closed.net_pnl,
+    });
+}
+
 #[inline]
 pub fn revalidate_entry(
     book: BookSnapshot,
@@ -211,6 +492,41 @@ fn order_size(price: f64, max_notional_usd: f64, max_shares: u64) -> u64 {
         return 0;
     }
     ((max_notional_usd / price).floor() as u64).min(max_shares)
+}
+
+fn buy_price(response: &PostOrderResponse) -> Option<f64> {
+    price_ratio(response.making_amount, response.taking_amount)
+}
+
+fn sell_price(response: &PostOrderResponse) -> Option<f64> {
+    price_ratio(response.taking_amount, response.making_amount)
+}
+
+fn price_ratio(numerator: Decimal, denominator: Decimal) -> Option<f64> {
+    let denominator = decimal_to_f64(denominator)?;
+    if denominator <= 0.0 {
+        return None;
+    }
+    Some(decimal_to_f64(numerator)? / denominator)
+}
+
+fn decimal_to_f64(value: Decimal) -> Option<f64> {
+    value.to_string().parse().ok()
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn parse_signature_type(value: Option<&str>, has_funder: bool) -> Result<SignatureType> {
+    let value = value.unwrap_or(if has_funder { "3" } else { "0" });
+    match value {
+        "0" | "EOA" | "eoa" => Ok(SignatureType::Eoa),
+        "1" | "PROXY" | "proxy" => Ok(SignatureType::Proxy),
+        "2" | "GNOSIS_SAFE" | "gnosis_safe" => Ok(SignatureType::GnosisSafe),
+        "3" | "POLY1271" | "poly1271" => Ok(SignatureType::Poly1271),
+        _ => anyhow::bail!("invalid POLYMARKET_SIGNATURE_TYPE"),
+    }
 }
 
 #[cfg(test)]

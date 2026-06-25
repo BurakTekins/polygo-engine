@@ -52,10 +52,7 @@ pub async fn run(
             continue;
         };
         if last_signal_side == Some(candidate.side)
-            && candidate
-                .signal_ts_ms
-                .saturating_sub(last_signal_ts_ms)
-                < config.hold_ms
+            && candidate.signal_ts_ms.saturating_sub(last_signal_ts_ms) < config.hold_ms
         {
             continue;
         }

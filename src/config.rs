@@ -1,3 +1,5 @@
+use std::env;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,15 @@ pub struct EngineConfig {
 pub enum ExecutionMode {
     DryRun,
     Live,
+}
+
+impl ExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Live => "live",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -60,16 +71,16 @@ impl EngineConfig {
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read engine config: {path}"))?;
-        let config: Self =
+        let mut config: Self =
             serde_json::from_str(&raw).with_context(|| format!("invalid engine config: {path}"))?;
+        if let Some(execution_mode) = execution_mode_override()? {
+            config.execution_mode = execution_mode;
+        }
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
-        if self.execution_mode == ExecutionMode::Live {
-            bail!("live execution is disabled: no authenticated order adapter is installed");
-        }
         if self.market.gamma_base_url.is_empty()
             || self.market.slug_prefix.is_empty()
             || self.market.interval_seconds == 0
@@ -101,4 +112,21 @@ impl EngineConfig {
         }
         Ok(())
     }
+}
+
+fn execution_mode_override() -> Result<Option<ExecutionMode>> {
+    let Some(raw) = env_nonempty("POLYGO_ENGINE_EXECUTION_MODE")
+        .or_else(|| env_nonempty("POLYGO_TRADING_MODE"))
+    else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "dry_run" | "dry-run" | "dryrun" => Ok(Some(ExecutionMode::DryRun)),
+        "live" => Ok(Some(ExecutionMode::Live)),
+        _ => bail!("invalid POLYGO_ENGINE_EXECUTION_MODE"),
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
 }

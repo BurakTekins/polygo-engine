@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use polygo_engine::config::EngineConfig;
+use polygo_engine::config::{EngineConfig, ExecutionMode};
 use polygo_engine::emitter::audit::AuditEmitter;
 use polygo_engine::engine::state::EngineState;
-use polygo_engine::executor::order::OrderSignal;
+use polygo_engine::executor::order::{LiveExecutor, OrderSignal};
 use polygo_engine::health::HealthState;
 use polygo_engine::market::{ActiveMarket, MarketClock};
 use polygo_engine::runtime_config::StrategyStore;
@@ -15,6 +15,8 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenv::dotenv().ok();
+
     let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("polygo_engine=info".parse()?))
@@ -22,6 +24,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Arc::new(EngineConfig::load("config.json")?);
+    let execution_mode = config.execution_mode;
+    let live_executor = match execution_mode {
+        ExecutionMode::DryRun => None,
+        ExecutionMode::Live => Some(LiveExecutor::from_env().await?),
+    };
     let health = Arc::new(HealthState::new());
     let market_clock = Arc::new(MarketClock::default());
     let book_state = Arc::new(BookState::default());
@@ -33,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let audit = AuditEmitter::new(
         config.integration.java_audit_endpoint.clone(),
         Arc::clone(&health),
+        execution_mode.as_str(),
     );
     let (market_tx, market_rx) = watch::channel::<Option<ActiveMarket>>(None);
     let (binance_tx, binance_rx) = mpsc::channel::<PriceTick>(8_192);
@@ -50,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&health),
     ));
     let polymarket_handle = tokio::spawn(polygo_engine::ws::polymarket::run(
-        market_rx,
+        market_rx.clone(),
         Arc::clone(&book_state),
         Arc::clone(&health),
     ));
@@ -65,11 +73,14 @@ async fn main() -> anyhow::Result<()> {
     ));
     let executor_handle = tokio::spawn(polygo_engine::executor::order::run(
         order_rx,
+        market_rx,
         Arc::clone(&book_state),
         Arc::clone(&engine_state),
         Arc::clone(&health),
         Arc::clone(&market_clock),
         Arc::clone(&strategy_store),
+        execution_mode,
+        live_executor,
         audit,
     ));
     let control_handle = tokio::spawn(polygo_engine::control::run(

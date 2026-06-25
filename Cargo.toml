@@ -37,6 +37,8 @@ dotenv = "0.15.0"
 # Fast URL parsing layer required for secure WebSocket endpoint verification
 url = "2"
 
+polymarket_client_sdk_v2 = { version = "=0.6.0-canary.1", features = ["clob"] }
+alloy = { version = "1.8.3", features = ["signer-local"] }
 
 [profile.release]
 opt-level = 3        # Enable maximum optimizations for high-frequency trading execution
