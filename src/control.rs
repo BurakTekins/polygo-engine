@@ -632,6 +632,8 @@ mod tests {
             "minProgress":0.05,
             "maxProgress":0.90,
             "maxSpread":0.02,
+            "minPrice":0.05,
+            "maxPrice":0.95,
             "maxNotionalUsd":100,
             "maxShares":500,
             "upOutcome":"YES",

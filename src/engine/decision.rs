@@ -25,7 +25,6 @@ pub async fn run(
     let mut strategy = None;
     let mut strategy_generation = 0;
     let mut last_signal_ts_ms = 0;
-    let mut last_signal_side = None;
     info!("Decision engine started");
 
     while let Some(tick) = binance_rx.recv().await {
@@ -39,7 +38,6 @@ pub async fn run(
             ));
             strategy_generation = config.generation;
             last_signal_ts_ms = 0;
-            last_signal_side = None;
         }
         let received_at_ms = now_ms();
         if received_at_ms.saturating_sub(tick.trade_time_ms) > config.max_book_age_ms {
@@ -51,12 +49,7 @@ pub async fn run(
         let Some(candidate) = candidate else {
             continue;
         };
-        if last_signal_side == Some(candidate.side)
-            && candidate
-                .signal_ts_ms
-                .saturating_sub(last_signal_ts_ms)
-                < config.hold_ms
-        {
+        if candidate.signal_ts_ms.saturating_sub(last_signal_ts_ms) < config.hold_ms {
             continue;
         }
         if !health.is_running()
@@ -103,7 +96,6 @@ pub async fn run(
             anyhow::bail!("execution channel full or closed");
         }
         last_signal_ts_ms = candidate.signal_ts_ms;
-        last_signal_side = Some(candidate.side);
     }
     Ok(())
 }

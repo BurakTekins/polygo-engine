@@ -42,10 +42,10 @@ impl EngineState {
         }
         self.open_or_reserved
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current < self.max_open_positions).then_some(current + 1)
+                (current == 0 && current < self.max_open_positions).then_some(current + 1)
             })
             .map(|_| ())
-            .map_err(|_| "max_open_positions")
+            .map_err(|_| "position_active")
     }
 
     #[inline(always)]
@@ -115,9 +115,12 @@ mod tests {
     }
 
     #[test]
-    fn atomic_reservations_enforce_position_limit() {
-        let state = EngineState::new(1, 100.0);
+    fn atomic_reservations_enforce_single_active_position() {
+        let state = EngineState::new(5, 100.0);
         assert!(state.try_reserve().is_ok());
-        assert_eq!(state.try_reserve(), Err("max_open_positions"));
+        assert_eq!(state.try_reserve(), Err("position_active"));
+
+        state.release_reservation();
+        assert!(state.try_reserve().is_ok());
     }
 }

@@ -168,6 +168,8 @@ fn java_config() -> JavaStrategyConfig {
         min_progress: 0.05,
         max_progress: 0.90,
         max_spread: 0.02,
+        min_price: 0.05,
+        max_price: 0.95,
         max_notional_usd: 100.0,
         max_shares: 500,
         up_outcome: "YES".into(),

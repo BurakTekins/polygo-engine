@@ -139,18 +139,20 @@ async fn execute_dry_run(
     let exit_at_ms = now_ms();
     let book = book_state.load();
     if exit_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
+        engine_state.release_reservation();
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
-            reason: "stale_exit_book_position_left_open",
+            reason: "stale_exit_book_position_released",
         });
         return;
     }
     let Some(exit_price) = outcome_book(book, signal.side).bid else {
+        engine_state.release_reservation();
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
-            reason: "missing_exit_bid_position_left_open",
+            reason: "missing_exit_bid_position_released",
         });
         return;
     };
