@@ -20,7 +20,7 @@ pub struct AuditEnvelope {
     pub event: AuditEvent,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum AuditEvent {
     SignalAccepted {
@@ -43,6 +43,34 @@ pub enum AuditEvent {
         position_id: u64,
         closed_at_ms: u64,
         side: &'static str,
+        entry_price: f64,
+        exit_price: f64,
+        shares: u64,
+        gross_pnl: f64,
+        entry_fee: f64,
+        exit_fee: f64,
+        net_pnl: f64,
+    },
+    LiveEntry {
+        position_id: u64,
+        signal_ts_ms: u64,
+        executed_at_ms: u64,
+        latency_ms: u64,
+        side: &'static str,
+        token_id: String,
+        order_id: String,
+        order_status: String,
+        price: f64,
+        shares: u64,
+        notional_usd: f64,
+    },
+    LiveExit {
+        position_id: u64,
+        closed_at_ms: u64,
+        side: &'static str,
+        token_id: String,
+        order_id: String,
+        order_status: String,
         entry_price: f64,
         exit_price: f64,
         shares: u64,
@@ -91,7 +119,11 @@ pub struct AuditEmitter {
 }
 
 impl AuditEmitter {
-    pub fn new(endpoint: Option<String>, health: Arc<HealthState>) -> Self {
+    pub fn new(
+        endpoint: Option<String>,
+        health: Arc<HealthState>,
+        execution_mode: &'static str,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<AuditEvent>(1_024);
         let (local_tx, local_rx) = mpsc::channel::<Vec<u8>>(1_024);
         let (java_tx, java_rx) = mpsc::channel::<Vec<u8>>(1_024);
@@ -107,7 +139,7 @@ impl AuditEmitter {
                 let envelope = AuditEnvelope {
                     schema_version: 1,
                     source: "polygo-engine",
-                    execution_mode: "dry_run",
+                    execution_mode,
                     emitted_at_ms: now_ms(),
                     event,
                 };

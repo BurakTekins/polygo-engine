@@ -96,7 +96,7 @@ fn main() {
         binance_price: 68_009.0,
     };
     measure("audit_try_enqueue", 20_000, 64, || {
-        audit_tx.try_send(audit_event).unwrap();
+        audit_tx.try_send(audit_event.clone()).unwrap();
         black_box(audit_rx.try_recv().unwrap());
     });
 

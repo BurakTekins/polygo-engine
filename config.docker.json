@@ -17,10 +17,10 @@
   },
   "risk": {
     "max_spread": 0.02,
-    "max_notional_usd": 100.0,
-    "max_shares": 500,
-    "max_open_positions": 5,
-    "daily_loss_limit_usd": 500.0
+    "max_notional_usd": 1.0,
+    "max_shares": 20,
+    "max_open_positions": 1,
+    "daily_loss_limit_usd": 5.0
   },
   "integration": {
     "java_audit_endpoint": "http://audit-service:8081/api/v1/audit-events/engine"

@@ -18,6 +18,15 @@ pub enum ExecutionMode {
     Live,
 }
 
+impl ExecutionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DryRun => "dry_run",
+            Self::Live => "live",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MarketConfig {
     pub gamma_base_url: String,
@@ -67,9 +76,6 @@ impl EngineConfig {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.execution_mode == ExecutionMode::Live {
-            bail!("live execution is disabled: no authenticated order adapter is installed");
-        }
         if self.market.gamma_base_url.is_empty()
             || self.market.slug_prefix.is_empty()
             || self.market.interval_seconds == 0

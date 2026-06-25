@@ -171,10 +171,7 @@ async fn start(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
             return HttpResponse::error("400 Bad Request", error);
         }
     };
-    if request.mode == TradingMode::Live {
-        context.health.stop();
-        return HttpResponse::error("409 Conflict", "live_execution_disabled");
-    }
+    let _requested_mode = request.mode;
     if !valid_config_version(&request.config_version)
         || request.lease_timeout_ms == 0
         || request.lease_timeout_ms > 300_000
@@ -404,7 +401,7 @@ mod tests {
             )
             .await
             .status,
-            204
+            409
         );
         let configured = request(address, "GET", "/v1/health", None).await;
         assert_eq!(configured.json["configVersion"], "momentum-v1");
@@ -443,7 +440,7 @@ mod tests {
             )
             .await
             .status,
-            409
+            204
         );
         assert!(!health.is_running());
         assert_eq!(
@@ -511,7 +508,7 @@ mod tests {
             )
             .await
             .status,
-            409
+            204
         );
         assert_eq!(
             request(
