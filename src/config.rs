@@ -1,3 +1,5 @@
+use std::env;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +41,11 @@ pub struct MarketConfig {
 pub struct StrategyConfig {
     pub momentum_window_ms: u64,
     pub momentum_threshold_usd: f64,
+    pub buy_yes_momentum_threshold_usd: f64,
+    pub buy_no_momentum_threshold_usd: f64,
     pub execution_latency_ms: u64,
     pub hold_ms: u64,
+    pub min_expected_price_move: f64,
     pub min_market_progress: f64,
     pub max_market_progress: f64,
     pub max_book_age_ms: u64,
@@ -69,8 +74,11 @@ impl EngineConfig {
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read engine config: {path}"))?;
-        let config: Self =
+        let mut config: Self =
             serde_json::from_str(&raw).with_context(|| format!("invalid engine config: {path}"))?;
+        if let Some(execution_mode) = execution_mode_override()? {
+            config.execution_mode = execution_mode;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -86,7 +94,11 @@ impl EngineConfig {
         let strategy = &self.strategy;
         if strategy.momentum_window_ms == 0
             || strategy.momentum_threshold_usd <= 0.0
+            || strategy.buy_yes_momentum_threshold_usd <= 0.0
+            || strategy.buy_no_momentum_threshold_usd <= 0.0
             || strategy.hold_ms == 0
+            || !strategy.min_expected_price_move.is_finite()
+            || strategy.min_expected_price_move < 0.0
             || !(0.0..1.0).contains(&strategy.min_market_progress)
             || !(0.0..=1.0).contains(&strategy.max_market_progress)
             || strategy.min_market_progress >= strategy.max_market_progress
@@ -107,4 +119,21 @@ impl EngineConfig {
         }
         Ok(())
     }
+}
+
+fn execution_mode_override() -> Result<Option<ExecutionMode>> {
+    let Some(raw) = env_nonempty("POLYGO_ENGINE_EXECUTION_MODE")
+        .or_else(|| env_nonempty("POLYGO_TRADING_MODE"))
+    else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "dry_run" | "dry-run" | "dryrun" => Ok(Some(ExecutionMode::DryRun)),
+        "live" => Ok(Some(ExecutionMode::Live)),
+        _ => bail!("invalid POLYGO_ENGINE_EXECUTION_MODE"),
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
 }

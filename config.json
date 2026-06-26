@@ -9,8 +9,11 @@
   "strategy": {
     "momentum_window_ms": 100,
     "momentum_threshold_usd": 8.0,
+    "buy_yes_momentum_threshold_usd": 12.0,
+    "buy_no_momentum_threshold_usd": 8.0,
     "execution_latency_ms": 100,
     "hold_ms": 5000,
+    "min_expected_price_move": 0.05,
     "min_market_progress": 0.05,
     "max_market_progress": 0.90,
     "max_book_age_ms": 300

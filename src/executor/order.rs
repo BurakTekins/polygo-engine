@@ -465,6 +465,9 @@ pub fn revalidate_entry(
         return None;
     }
     let shares = order_size(ask, config.max_notional_usd, config.max_shares);
+    if !expected_move_covers_fees(ask, shares, config.min_expected_price_move) {
+        return None;
+    }
     (shares > 0).then_some((ask, shares))
 }
 
@@ -494,6 +497,23 @@ fn order_size(price: f64, max_notional_usd: f64, max_shares: u64) -> u64 {
         return 0;
     }
     ((max_notional_usd / price).floor() as u64).min(max_shares)
+}
+
+fn expected_move_covers_fees(entry_price: f64, shares: u64, min_expected_price_move: f64) -> bool {
+    if shares == 0 {
+        return false;
+    }
+    if min_expected_price_move <= 0.0 {
+        return true;
+    }
+    let exit_price = (entry_price + min_expected_price_move).min(1.0);
+    let gross = min_expected_price_move * shares as f64;
+    let fees = fee(entry_price, shares) + fee(exit_price, shares);
+    gross > fees
+}
+
+fn fee(price: f64, shares: u64) -> f64 {
+    shares as f64 * 0.07 * price * (1.0 - price)
 }
 
 fn buy_price(response: &PostOrderResponse) -> Option<f64> {
