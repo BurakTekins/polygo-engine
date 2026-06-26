@@ -11,8 +11,11 @@ pub struct JavaStrategyConfig {
     pub config_version: String,
     pub momentum_window_ms: u64,
     pub momentum_threshold_usd: f64,
+    pub buy_yes_momentum_threshold_usd: f64,
+    pub buy_no_momentum_threshold_usd: f64,
     pub execution_latency_ms: u64,
     pub hold_ms: u64,
+    pub min_expected_price_move: f64,
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
@@ -32,10 +35,15 @@ impl JavaStrategyConfig {
         if self.momentum_window_ms == 0
             || self.hold_ms == 0
             || !positive_finite(self.momentum_threshold_usd)
+            || !positive_finite(self.buy_yes_momentum_threshold_usd)
+            || !positive_finite(self.buy_no_momentum_threshold_usd)
             || !positive_finite(self.max_notional_usd)
             || self.max_shares == 0
         {
             return Err("invalid_strategy_limits");
+        }
+        if !self.min_expected_price_move.is_finite() || self.min_expected_price_move < 0.0 {
+            return Err("invalid_min_expected_price_move");
         }
         if !self.min_progress.is_finite()
             || !self.max_progress.is_finite()
@@ -68,8 +76,11 @@ pub struct StrategySnapshot {
     pub generation: u64,
     pub momentum_window_ms: u64,
     pub momentum_threshold_usd: f64,
+    pub buy_yes_momentum_threshold_usd: f64,
+    pub buy_no_momentum_threshold_usd: f64,
     pub execution_latency_ms: u64,
     pub hold_ms: u64,
+    pub min_expected_price_move: f64,
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
@@ -87,8 +98,11 @@ pub struct StrategyStore {
     configured: AtomicBool,
     momentum_window_ms: AtomicU64,
     momentum_threshold_usd: AtomicU64,
+    buy_yes_momentum_threshold_usd: AtomicU64,
+    buy_no_momentum_threshold_usd: AtomicU64,
     execution_latency_ms: AtomicU64,
     hold_ms: AtomicU64,
+    min_expected_price_move: AtomicU64,
     min_progress: AtomicU64,
     max_progress: AtomicU64,
     max_spread: AtomicU64,
@@ -108,8 +122,15 @@ impl StrategyStore {
             configured: AtomicBool::new(false),
             momentum_window_ms: AtomicU64::new(defaults.momentum_window_ms),
             momentum_threshold_usd: AtomicU64::new(defaults.momentum_threshold_usd.to_bits()),
+            buy_yes_momentum_threshold_usd: AtomicU64::new(
+                defaults.buy_yes_momentum_threshold_usd.to_bits(),
+            ),
+            buy_no_momentum_threshold_usd: AtomicU64::new(
+                defaults.buy_no_momentum_threshold_usd.to_bits(),
+            ),
             execution_latency_ms: AtomicU64::new(defaults.execution_latency_ms),
             hold_ms: AtomicU64::new(defaults.hold_ms),
+            min_expected_price_move: AtomicU64::new(defaults.min_expected_price_move.to_bits()),
             min_progress: AtomicU64::new(defaults.min_market_progress.to_bits()),
             max_progress: AtomicU64::new(defaults.max_market_progress.to_bits()),
             max_spread: AtomicU64::new(risk.max_spread.to_bits()),
@@ -133,9 +154,15 @@ impl StrategyStore {
             .store(config.momentum_window_ms, Ordering::Relaxed);
         self.momentum_threshold_usd
             .store(config.momentum_threshold_usd.to_bits(), Ordering::Relaxed);
+        self.buy_yes_momentum_threshold_usd
+            .store(config.buy_yes_momentum_threshold_usd.to_bits(), Ordering::Relaxed);
+        self.buy_no_momentum_threshold_usd
+            .store(config.buy_no_momentum_threshold_usd.to_bits(), Ordering::Relaxed);
         self.execution_latency_ms
             .store(config.execution_latency_ms, Ordering::Relaxed);
         self.hold_ms.store(config.hold_ms, Ordering::Relaxed);
+        self.min_expected_price_move
+            .store(config.min_expected_price_move.to_bits(), Ordering::Relaxed);
         self.min_progress
             .store(config.min_progress.to_bits(), Ordering::Relaxed);
         self.max_progress
@@ -173,8 +200,17 @@ impl StrategyStore {
                 momentum_threshold_usd: f64::from_bits(
                     self.momentum_threshold_usd.load(Ordering::Relaxed),
                 ),
+                buy_yes_momentum_threshold_usd: f64::from_bits(
+                    self.buy_yes_momentum_threshold_usd.load(Ordering::Relaxed),
+                ),
+                buy_no_momentum_threshold_usd: f64::from_bits(
+                    self.buy_no_momentum_threshold_usd.load(Ordering::Relaxed),
+                ),
                 execution_latency_ms: self.execution_latency_ms.load(Ordering::Relaxed),
                 hold_ms: self.hold_ms.load(Ordering::Relaxed),
+                min_expected_price_move: f64::from_bits(
+                    self.min_expected_price_move.load(Ordering::Relaxed),
+                ),
                 min_progress: f64::from_bits(self.min_progress.load(Ordering::Relaxed)),
                 max_progress: f64::from_bits(self.max_progress.load(Ordering::Relaxed)),
                 max_spread: f64::from_bits(self.max_spread.load(Ordering::Relaxed)),
@@ -218,8 +254,11 @@ mod tests {
         let defaults = StrategyConfig {
             momentum_window_ms: 100,
             momentum_threshold_usd: 8.0,
+            buy_yes_momentum_threshold_usd: 12.0,
+            buy_no_momentum_threshold_usd: 8.0,
             execution_latency_ms: 100,
             hold_ms: 5_000,
+            min_expected_price_move: 0.05,
             min_market_progress: 0.05,
             max_market_progress: 0.9,
             max_book_age_ms: 300,
@@ -246,8 +285,11 @@ mod tests {
             config_version: "momentum-v1".into(),
             momentum_window_ms: 100,
             momentum_threshold_usd: 8.0,
+            buy_yes_momentum_threshold_usd: 12.0,
+            buy_no_momentum_threshold_usd: 8.0,
             execution_latency_ms: 100,
             hold_ms: 5_000,
+            min_expected_price_move: 0.05,
             min_progress: 0.05,
             max_progress: 0.9,
             max_spread: 0.02,

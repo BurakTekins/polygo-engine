@@ -41,8 +41,11 @@ pub struct MarketConfig {
 pub struct StrategyConfig {
     pub momentum_window_ms: u64,
     pub momentum_threshold_usd: f64,
+    pub buy_yes_momentum_threshold_usd: f64,
+    pub buy_no_momentum_threshold_usd: f64,
     pub execution_latency_ms: u64,
     pub hold_ms: u64,
+    pub min_expected_price_move: f64,
     pub min_market_progress: f64,
     pub max_market_progress: f64,
     pub max_book_age_ms: u64,
@@ -91,7 +94,11 @@ impl EngineConfig {
         let strategy = &self.strategy;
         if strategy.momentum_window_ms == 0
             || strategy.momentum_threshold_usd <= 0.0
+            || strategy.buy_yes_momentum_threshold_usd <= 0.0
+            || strategy.buy_no_momentum_threshold_usd <= 0.0
             || strategy.hold_ms == 0
+            || !strategy.min_expected_price_move.is_finite()
+            || strategy.min_expected_price_move < 0.0
             || !(0.0..1.0).contains(&strategy.min_market_progress)
             || !(0.0..=1.0).contains(&strategy.max_market_progress)
             || strategy.min_market_progress >= strategy.max_market_progress

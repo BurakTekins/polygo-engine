@@ -18,19 +18,29 @@ pub trait Strategy: Send {
 
 pub struct MomentumStrategy {
     window_ms: u64,
-    threshold_usd: f64,
+    buy_yes_threshold_usd: f64,
+    buy_no_threshold_usd: f64,
     prices: VecDeque<PriceTick>,
 }
 
 impl MomentumStrategy {
     pub fn new(config: &StrategyConfig) -> Self {
-        Self::with_params(config.momentum_window_ms, config.momentum_threshold_usd)
+        Self::with_params(
+            config.momentum_window_ms,
+            config.buy_yes_momentum_threshold_usd,
+            config.buy_no_momentum_threshold_usd,
+        )
     }
 
-    pub fn with_params(window_ms: u64, threshold_usd: f64) -> Self {
+    pub fn with_params(
+        window_ms: u64,
+        buy_yes_threshold_usd: f64,
+        buy_no_threshold_usd: f64,
+    ) -> Self {
         Self {
             window_ms,
-            threshold_usd,
+            buy_yes_threshold_usd,
+            buy_no_threshold_usd,
             prices: VecDeque::with_capacity(512),
         }
     }
@@ -50,16 +60,21 @@ impl Strategy for MomentumStrategy {
         }
 
         let momentum_usd = tick.price - baseline.price;
-        if momentum_usd.abs() < self.threshold_usd {
+        let side = if momentum_usd > 0.0 {
+            OrderSide::BuyYes
+        } else {
+            OrderSide::BuyNo
+        };
+        let threshold_usd = match side {
+            OrderSide::BuyYes => self.buy_yes_threshold_usd,
+            OrderSide::BuyNo => self.buy_no_threshold_usd,
+        };
+        if momentum_usd.abs() < threshold_usd {
             return None;
         }
 
         Some(StrategySignal {
-            side: if momentum_usd > 0.0 {
-                OrderSide::BuyYes
-            } else {
-                OrderSide::BuyNo
-            },
+            side,
             momentum_usd,
             binance_price: tick.price,
             signal_ts_ms: received_at_ms,
@@ -75,8 +90,11 @@ mod tests {
         StrategyConfig {
             momentum_window_ms: 100,
             momentum_threshold_usd: 8.0,
+            buy_yes_momentum_threshold_usd: 12.0,
+            buy_no_momentum_threshold_usd: 8.0,
             execution_latency_ms: 100,
             hold_ms: 5_000,
+            min_expected_price_move: 0.05,
             min_market_progress: 0.05,
             max_market_progress: 0.90,
             max_book_age_ms: 300,
@@ -92,7 +110,7 @@ mod tests {
         );
         assert_eq!(
             strategy
-                .on_binance_tick(PriceTick::new(109.0, 1_100), 1_101)
+                .on_binance_tick(PriceTick::new(113.0, 1_100), 1_101)
                 .unwrap()
                 .side,
             OrderSide::BuyYes

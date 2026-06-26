@@ -583,6 +583,13 @@ mod tests {
         assert!(!health.is_running());
         assert!(strategy_store.version_matches("v2"));
         assert_eq!(strategy_store.load().unwrap().momentum_threshold_usd, 8.0);
+        assert_eq!(
+            strategy_store
+                .load()
+                .unwrap()
+                .buy_yes_momentum_threshold_usd,
+            12.0
+        );
         server.abort();
     }
 
@@ -624,11 +631,16 @@ mod tests {
             "configVersion":version,
             "momentumWindowMs":100,
             "momentumThresholdUsd":8,
+            "buyYesMomentumThresholdUsd":12,
+            "buyNoMomentumThresholdUsd":8,
             "executionLatencyMs":100,
             "holdMs":5000,
+            "minExpectedPriceMove":0.05,
             "minProgress":0.05,
             "maxProgress":0.90,
             "maxSpread":0.02,
+            "minPrice":0.25,
+            "maxPrice":0.75,
             "maxNotionalUsd":100,
             "maxShares":500,
             "upOutcome":"YES",
@@ -648,8 +660,11 @@ mod tests {
             strategy: StrategyConfig {
                 momentum_window_ms: 100,
                 momentum_threshold_usd: 8.0,
+                buy_yes_momentum_threshold_usd: 12.0,
+                buy_no_momentum_threshold_usd: 8.0,
                 execution_latency_ms: 100,
                 hold_ms: 5_000,
+                min_expected_price_move: 0.05,
                 min_market_progress: 0.05,
                 max_market_progress: 0.90,
                 max_book_age_ms: 300,

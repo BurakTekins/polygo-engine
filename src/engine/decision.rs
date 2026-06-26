@@ -34,7 +34,8 @@ pub async fn run(
         if config.generation != strategy_generation {
             strategy = Some(MomentumStrategy::with_params(
                 config.momentum_window_ms,
-                config.momentum_threshold_usd,
+                config.buy_yes_momentum_threshold_usd,
+                config.buy_no_momentum_threshold_usd,
             ));
             strategy_generation = config.generation;
             last_signal_ts_ms = 0;
@@ -73,6 +74,7 @@ pub async fn run(
             continue;
         };
         if ask <= bid
+            || ask - bid > config.max_spread
             || ask < config.min_price
             || ask > config.max_price
             || engine_state.try_reserve().is_err()
