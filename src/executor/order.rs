@@ -337,7 +337,7 @@ async fn execute_live(
     let entry_response = match live_executor.buy_shares(token_id, shares).await {
         Ok(response) => response,
         Err(error) => {
-            warn!(%error, side = signal.side.as_str(), shares, "Live entry failed");
+            warn!(?error, side = signal.side.as_str(), shares, "Live entry failed");
             reject(signal, "live_entry_failed", &engine_state, &audit);
             return;
         }
