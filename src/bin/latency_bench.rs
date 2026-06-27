@@ -175,6 +175,7 @@ fn java_config() -> JavaStrategyConfig {
         max_price: 0.75,
         max_notional_usd: 100.0,
         max_shares: 500,
+        daily_loss_limit_usd: 500.0,
         up_outcome: "YES".into(),
         down_outcome: "NO".into(),
     }

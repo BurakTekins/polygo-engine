@@ -23,6 +23,7 @@ pub struct JavaStrategyConfig {
     pub max_price: f64,
     pub max_notional_usd: f64,
     pub max_shares: u64,
+    pub daily_loss_limit_usd: f64,
     pub up_outcome: String,
     pub down_outcome: String,
 }
@@ -38,6 +39,7 @@ impl JavaStrategyConfig {
             || !positive_finite(self.buy_yes_momentum_threshold_usd)
             || !positive_finite(self.buy_no_momentum_threshold_usd)
             || !positive_finite(self.max_notional_usd)
+            || !positive_finite(self.daily_loss_limit_usd)
             || self.max_shares == 0
         {
             return Err("invalid_strategy_limits");
@@ -297,6 +299,7 @@ mod tests {
             max_price: 0.95,
             max_notional_usd: 100.0,
             max_shares: 500,
+            daily_loss_limit_usd: 500.0,
             up_outcome: "YES".into(),
             down_outcome: "NO".into(),
         }

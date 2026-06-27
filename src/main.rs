@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let control_handle = tokio::spawn(polygo_engine::control::run(
         Arc::clone(&config),
         Arc::clone(&health),
+        Arc::clone(&engine_state),
         Arc::clone(&strategy_store),
     ));
     let watchdog_handle = tokio::spawn(polygo_engine::control::watchdog(Arc::clone(&health)));

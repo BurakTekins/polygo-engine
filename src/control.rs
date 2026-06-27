@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::config::EngineConfig;
+use crate::engine::state::EngineState;
 use crate::health::HealthState;
 use crate::market::now_ms;
 use crate::runtime_config::{JavaStrategyConfig, StrategyStore};
@@ -16,6 +17,7 @@ const MAX_REQUEST_BYTES: usize = 16_384;
 
 struct ControlContext {
     health: Arc<HealthState>,
+    engine_state: Arc<EngineState>,
     strategy_store: Arc<StrategyStore>,
     mutation: Mutex<()>,
 }
@@ -65,20 +67,23 @@ struct HttpRequest {
 pub async fn run(
     config: Arc<EngineConfig>,
     health: Arc<HealthState>,
+    engine_state: Arc<EngineState>,
     strategy_store: Arc<StrategyStore>,
 ) -> Result<()> {
     let listener = TcpListener::bind(&config.control.bind_addr).await?;
     info!(bind = %config.control.bind_addr, "Control plane listening");
-    serve(listener, health, strategy_store).await
+    serve(listener, health, engine_state, strategy_store).await
 }
 
 async fn serve(
     listener: TcpListener,
     health: Arc<HealthState>,
+    engine_state: Arc<EngineState>,
     strategy_store: Arc<StrategyStore>,
 ) -> Result<()> {
     let context = Arc::new(ControlContext {
         health,
+        engine_state,
         strategy_store,
         mutation: Mutex::new(()),
     });
@@ -158,7 +163,12 @@ async fn update_config(request: &HttpRequest, context: &ControlContext) -> HttpR
     let _guard = context.mutation.lock().await;
     context.health.stop();
     match context.strategy_store.update(&config) {
-        Ok(_) => HttpResponse::empty("204 No Content"),
+        Ok(_) => {
+            context
+                .engine_state
+                .set_daily_loss_limit_usd(config.daily_loss_limit_usd);
+            HttpResponse::empty("204 No Content")
+        }
         Err(error) => HttpResponse::error("500 Internal Server Error", error),
     }
 }
@@ -368,11 +378,16 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let config = Arc::new(test_config(address.to_string()));
         let health = Arc::new(HealthState::new());
+        let engine_state = Arc::new(EngineState::new(
+            config.risk.max_open_positions,
+            config.risk.daily_loss_limit_usd,
+        ));
         let strategy_store = Arc::new(StrategyStore::new(&config.strategy, &config.risk));
         health.set_market_ready(true);
         let server = tokio::spawn(serve(
             listener,
             Arc::clone(&health),
+            Arc::clone(&engine_state),
             Arc::clone(&strategy_store),
         ));
 
@@ -556,11 +571,16 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let config = Arc::new(test_config(address.to_string()));
         let health = Arc::new(HealthState::new());
+        let engine_state = Arc::new(EngineState::new(
+            config.risk.max_open_positions,
+            config.risk.daily_loss_limit_usd,
+        ));
         let strategy_store = Arc::new(StrategyStore::new(&config.strategy, &config.risk));
         health.set_market_ready(true);
         let server = tokio::spawn(serve(
             listener,
             Arc::clone(&health),
+            Arc::clone(&engine_state),
             Arc::clone(&strategy_store),
         ));
         request(address, "PUT", "/v1/config", Some(strategy_json("v1"))).await;
@@ -643,6 +663,7 @@ mod tests {
             "maxPrice":0.75,
             "maxNotionalUsd":100,
             "maxShares":500,
+            "dailyLossLimitUsd":500,
             "upOutcome":"YES",
             "downOutcome":"NO"
         })

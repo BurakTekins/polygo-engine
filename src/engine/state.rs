@@ -16,7 +16,7 @@ pub struct EngineState {
     open_or_reserved: AtomicUsize,
     next_position_id: AtomicU64,
     max_open_positions: usize,
-    daily_loss_limit_microusd: u64,
+    daily_loss_limit_microusd: AtomicU64,
     daily_loss_microusd: AtomicU64,
     total_pnl_microusd: AtomicI64,
     total_trades: AtomicU64,
@@ -28,7 +28,7 @@ impl EngineState {
             open_or_reserved: AtomicUsize::new(0),
             next_position_id: AtomicU64::new(1),
             max_open_positions,
-            daily_loss_limit_microusd: to_microusd(daily_loss_limit_usd),
+            daily_loss_limit_microusd: AtomicU64::new(to_microusd(daily_loss_limit_usd)),
             daily_loss_microusd: AtomicU64::new(0),
             total_pnl_microusd: AtomicI64::new(0),
             total_trades: AtomicU64::new(0),
@@ -37,7 +37,9 @@ impl EngineState {
 
     #[inline(always)]
     pub fn try_reserve(&self) -> Result<(), &'static str> {
-        if self.daily_loss_microusd.load(Ordering::Acquire) >= self.daily_loss_limit_microusd {
+        if self.daily_loss_microusd.load(Ordering::Acquire)
+            >= self.daily_loss_limit_microusd.load(Ordering::Acquire)
+        {
             return Err("daily_loss_limit");
         }
         self.open_or_reserved
@@ -51,6 +53,11 @@ impl EngineState {
     #[inline(always)]
     pub fn release_reservation(&self) {
         self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn set_daily_loss_limit_usd(&self, daily_loss_limit_usd: f64) {
+        self.daily_loss_limit_microusd
+            .store(to_microusd(daily_loss_limit_usd), Ordering::Release);
     }
 
     pub fn open_reserved(&self) -> u64 {
@@ -119,5 +126,16 @@ mod tests {
         let state = EngineState::new(5, 100.0);
         assert!(state.try_reserve().is_ok());
         assert_eq!(state.try_reserve(), Err("position_active"));
+    }
+
+    #[test]
+    fn updated_daily_loss_limit_applies_to_accumulated_loss() {
+        let state = EngineState::new(1, 5.0);
+        state.try_reserve().unwrap();
+        state.open_reserved();
+        state.close(0.50, 0.40, 100);
+        assert_eq!(state.try_reserve(), Err("daily_loss_limit"));
+        state.set_daily_loss_limit_usd(20.0);
+        assert!(state.try_reserve().is_ok());
     }
 }
