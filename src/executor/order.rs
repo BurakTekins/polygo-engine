@@ -337,7 +337,8 @@ async fn execute_live(
     let entry_response = match live_executor.buy_shares(token_id, shares).await {
         Ok(response) => response,
         Err(error) => {
-            warn!(?error, side = signal.side.as_str(), shares, "Live entry failed");
+            let error_chain = format!("{error:#}");
+            warn!(%error_chain, side = signal.side.as_str(), shares, "Live entry failed");
             reject(signal, "live_entry_failed", &engine_state, &audit);
             return;
         }
@@ -395,7 +396,8 @@ async fn execute_live(
     let exit_response = match live_executor.sell_shares(token_id, shares).await {
         Ok(response) => response,
         Err(error) => {
-            warn!(%error, side = signal.side.as_str(), shares, "Live exit failed; position may remain open");
+            let error_chain = format!("{error:#}");
+            warn!(%error_chain, side = signal.side.as_str(), shares, "Live exit failed; position may remain open");
             health.trip(5);
             let _ = audit.emit(AuditEvent::ExecutionRejected {
                 signal_ts_ms: signal.signal_ts_ms,
