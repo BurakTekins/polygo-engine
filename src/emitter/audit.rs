@@ -10,6 +10,33 @@ use crate::executor::order::OrderSignal;
 use crate::health::HealthState;
 use crate::market::now_ms;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditBookContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market_slug: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    pub yes_bid: Option<f64>,
+    pub yes_ask: Option<f64>,
+    pub no_bid: Option<f64>,
+    pub no_ask: Option<f64>,
+    pub book_received_at_ms: u64,
+    pub book_source_ts_ms: u64,
+    pub book_age_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_slippage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_limit_price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intended_shares: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intended_notional_usd: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuditEnvelope {
     pub schema_version: u8,
@@ -28,6 +55,8 @@ pub enum AuditEvent {
         side: &'static str,
         momentum_usd: f64,
         binance_price: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<AuditBookContext>,
     },
     DryRunEntry {
         position_id: u64,
@@ -63,6 +92,8 @@ pub enum AuditEvent {
         price: f64,
         shares: f64,
         notional_usd: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<AuditBookContext>,
     },
     LiveExit {
         position_id: u64,
@@ -83,16 +114,19 @@ pub enum AuditEvent {
         signal_ts_ms: u64,
         side: &'static str,
         reason: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<AuditBookContext>,
     },
 }
 
 impl AuditEvent {
-    pub fn signal(signal: OrderSignal) -> Self {
+    pub fn signal(signal: OrderSignal, context: Option<AuditBookContext>) -> Self {
         Self::SignalAccepted {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             momentum_usd: signal.momentum_usd,
             binance_price: signal.binance_price,
+            context,
         }
     }
 

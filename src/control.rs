@@ -10,7 +10,6 @@ use tracing::{info, warn};
 use crate::config::EngineConfig;
 use crate::engine::state::EngineState;
 use crate::health::HealthState;
-use crate::market::now_ms;
 use crate::runtime_config::{JavaStrategyConfig, StrategyStore};
 
 const MAX_REQUEST_BYTES: usize = 16_384;
@@ -34,14 +33,6 @@ enum TradingMode {
 struct StartRequest {
     mode: TradingMode,
     config_version: String,
-    lease_timeout_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct HeartbeatRequest {
-    config_version: String,
-    sent_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,17 +89,6 @@ async fn serve(
     }
 }
 
-pub async fn watchdog(health: Arc<HealthState>) {
-    loop {
-        let lease_timeout_ms = health.lease_timeout_ms();
-        let poll_ms = (lease_timeout_ms / 2).clamp(1, 1_000);
-        tokio::time::sleep(tokio::time::Duration::from_millis(poll_ms)).await;
-        if health.heartbeat_expired(now_ms()) {
-            health.trip(4);
-        }
-    }
-}
-
 async fn handle(mut stream: TcpStream, context: Arc<ControlContext>) -> Result<()> {
     let request = match read_request(&mut stream).await {
         Ok(request) => request,
@@ -126,7 +106,6 @@ async fn route(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
         ("GET", "/v1/health") => health_response(context),
         ("PUT", "/v1/config") => update_config(request, context).await,
         ("POST", "/v1/control/start") => start(request, context).await,
-        ("POST", "/v1/control/heartbeat") => heartbeat(request, context).await,
         ("POST", "/v1/control/stop") => stop(request, context).await,
         _ => HttpResponse::json("404 Not Found", &serde_json::json!({"error":"not_found"})),
     }
@@ -182,10 +161,7 @@ async fn start(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
         }
     };
     let _requested_mode = request.mode;
-    if !valid_config_version(&request.config_version)
-        || request.lease_timeout_ms == 0
-        || request.lease_timeout_ms > 300_000
-    {
+    if !valid_config_version(&request.config_version) {
         context.health.stop();
         return HttpResponse::error("422 Unprocessable Entity", "invalid_start_request");
     }
@@ -197,38 +173,7 @@ async fn start(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
         context.health.stop();
         return HttpResponse::error("409 Conflict", "config_version_mismatch");
     }
-    if context.health.is_running() && context.health.lease_timeout_ms() != request.lease_timeout_ms
-    {
-        context.health.stop();
-        return HttpResponse::error("409 Conflict", "start_parameters_conflict");
-    }
-    match context.health.start(now_ms(), request.lease_timeout_ms) {
-        Ok(()) => HttpResponse::empty("204 No Content"),
-        Err(error) => HttpResponse::error("409 Conflict", error),
-    }
-}
-
-async fn heartbeat(request: &HttpRequest, context: &ControlContext) -> HttpResponse {
-    let request: HeartbeatRequest = match parse_body(request) {
-        Ok(request) => request,
-        Err(error) => {
-            context.health.stop();
-            return HttpResponse::error("400 Bad Request", error);
-        }
-    };
-    if !valid_config_version(&request.config_version) || !valid_instant(&request.sent_at) {
-        context.health.stop();
-        return HttpResponse::error("422 Unprocessable Entity", "invalid_heartbeat");
-    }
-    let _guard = context.mutation.lock().await;
-    if !context
-        .strategy_store
-        .version_matches(&request.config_version)
-    {
-        context.health.stop();
-        return HttpResponse::error("409 Conflict", "config_version_mismatch");
-    }
-    match context.health.heartbeat(now_ms()) {
+    match context.health.start() {
         Ok(()) => HttpResponse::empty("204 No Content"),
         Err(error) => HttpResponse::error("409 Conflict", error),
     }
@@ -252,17 +197,6 @@ fn parse_body<T: DeserializeOwned>(request: &HttpRequest) -> Result<T, &'static 
         return Err("missing_request_body");
     }
     serde_json::from_slice(&request.body).map_err(|_| "invalid_json_body")
-}
-
-fn valid_instant(value: &str) -> bool {
-    value.len() >= 20
-        && value.as_bytes().get(4) == Some(&b'-')
-        && value.as_bytes().get(7) == Some(&b'-')
-        && value.contains('T')
-        && (value.ends_with('Z')
-            || value
-                .get(value.len().saturating_sub(6)..)
-                .is_some_and(|offset| offset.starts_with('+') || offset.starts_with('-')))
 }
 
 fn valid_config_version(value: &str) -> bool {
@@ -373,7 +307,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn java_v1_contract_and_lease_are_fail_closed() {
+    async fn java_v1_contract_controls_engine_state() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let config = Arc::new(test_config(address.to_string()));
@@ -423,8 +357,7 @@ mod tests {
 
         let start_body = serde_json::json!({
             "mode":"DRY_RUN",
-            "configVersion":"momentum-v1",
-            "leaseTimeoutMs":20
+            "configVersion":"momentum-v1"
         });
         assert_eq!(
             request(
@@ -443,21 +376,7 @@ mod tests {
                 .status,
             204
         );
-        assert_eq!(
-            request(
-                address,
-                "POST",
-                "/v1/control/heartbeat",
-                Some(serde_json::json!({
-                    "configVersion":"wrong",
-                    "sentAt":"2026-06-23T12:00:00Z"
-                })),
-            )
-            .await
-            .status,
-            204
-        );
-        assert!(!health.is_running());
+        assert!(health.is_running());
         assert_eq!(
             request(
                 address,
@@ -465,23 +384,8 @@ mod tests {
                 "/v1/control/start",
                 Some(serde_json::json!({
                     "mode":"DRY_RUN",
-                    "configVersion":"momentum-v1",
-                    "leaseTimeoutMs":20
+                    "configVersion":"momentum-v1"
                 }))
-            )
-            .await
-            .status,
-            204
-        );
-        assert_eq!(
-            request(
-                address,
-                "POST",
-                "/v1/control/heartbeat",
-                Some(serde_json::json!({
-                    "configVersion":"momentum-v1",
-                    "sentAt":"2026-06-23T12:00:00Z"
-                })),
             )
             .await
             .status,
@@ -517,8 +421,7 @@ mod tests {
                 "/v1/control/start",
                 Some(serde_json::json!({
                     "mode":"LIVE",
-                    "configVersion":"momentum-v1",
-                    "leaseTimeoutMs":20
+                    "configVersion":"momentum-v1"
                 })),
             )
             .await
@@ -532,8 +435,7 @@ mod tests {
                 "/v1/control/start",
                 Some(serde_json::json!({
                     "mode":"DRY_RUN",
-                    "configVersion":"wrong",
-                    "leaseTimeoutMs":20
+                    "configVersion":"wrong"
                 }))
             )
             .await
@@ -548,20 +450,18 @@ mod tests {
                 "/v1/control/start",
                 Some(serde_json::json!({
                     "mode":"DRY_RUN",
-                    "configVersion":"momentum-v1",
-                    "leaseTimeoutMs":20
+                    "configVersion":"momentum-v1"
                 }))
             )
             .await
             .status,
             204
         );
-        let lease = tokio::spawn(watchdog(Arc::clone(&health)));
         tokio::time::sleep(tokio::time::Duration::from_millis(60)).await;
-        assert!(health.is_faulted());
-        assert_eq!(health.snapshot().fault, "heartbeat_timeout");
+        assert!(health.is_running());
+        assert!(!health.is_faulted());
+        assert_eq!(health.snapshot().fault, "none");
 
-        lease.abort();
         server.abort();
     }
 
@@ -589,7 +489,7 @@ mod tests {
             "POST",
             "/v1/control/start",
             Some(serde_json::json!({
-                "mode":"DRY_RUN","configVersion":"v1","leaseTimeoutMs":2000
+                "mode":"DRY_RUN","configVersion":"v1"
             })),
         )
         .await;

@@ -89,7 +89,6 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&engine_state),
         Arc::clone(&strategy_store),
     ));
-    let watchdog_handle = tokio::spawn(polygo_engine::control::watchdog(Arc::clone(&health)));
 
     tokio::select! {
         result = market_handle => error!(?result, "Market manager stopped"),
@@ -98,7 +97,6 @@ async fn main() -> anyhow::Result<()> {
         result = decision_handle => error!(?result, "Decision task stopped"),
         result = executor_handle => error!(?result, "Executor task stopped"),
         result = control_handle => error!(?result, "Control task stopped"),
-        result = watchdog_handle => error!(?result, "Watchdog task stopped"),
     }
     anyhow::bail!("critical engine task stopped")
 }

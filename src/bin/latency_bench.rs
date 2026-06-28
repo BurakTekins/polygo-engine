@@ -94,6 +94,7 @@ fn main() {
         side: "BUY_YES",
         momentum_usd: 9.0,
         binance_price: 68_009.0,
+        context: None,
     };
     measure("audit_try_enqueue", 20_000, 64, || {
         audit_tx.try_send(audit_event.clone()).unwrap();

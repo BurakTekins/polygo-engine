@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::ExecutionMode;
-use crate::emitter::audit::{AuditEmitter, AuditEvent};
+use crate::emitter::audit::{AuditBookContext, AuditEmitter, AuditEvent};
 use crate::engine::state::{round_5, EngineState};
 use crate::health::HealthState;
 use crate::market::{now_ms, ActiveMarket, MarketClock};
@@ -177,7 +177,17 @@ pub async fn run(
 ) {
     info!(mode = execution_mode.as_str(), "Executor started");
     while let Some(signal) = order_rx.recv().await {
-        let _ = audit.emit(AuditEvent::signal(signal));
+        let signal_market = market_rx.borrow().clone();
+        let signal_context = audit_context(
+            book_state.load(),
+            now_ms(),
+            signal.side,
+            signal_market.as_ref(),
+            None,
+            None,
+            None,
+        );
+        let _ = audit.emit(AuditEvent::signal(signal, Some(signal_context)));
         let task_market_rx = market_rx.clone();
         let task_book_state = Arc::clone(&book_state);
         let task_state = Arc::clone(&engine_state);
@@ -251,7 +261,21 @@ async fn execute_dry_run(
     let Some((ask, shares)) =
         revalidate_entry(book, executed_at_ms, &market_clock, &config, signal.side)
     else {
-        reject(signal, "entry_revalidation", &engine_state, &audit);
+        reject_with_context(
+            signal,
+            "entry_revalidation",
+            &engine_state,
+            &audit,
+            Some(audit_context(
+                book,
+                executed_at_ms,
+                signal.side,
+                None,
+                Some(config.entry_slippage),
+                None,
+                None,
+            )),
+        );
         return;
     };
 
@@ -276,6 +300,7 @@ async fn execute_dry_run(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "stale_exit_book_position_released",
+            context: None,
         });
         return;
     }
@@ -285,6 +310,7 @@ async fn execute_dry_run(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "missing_exit_bid_position_released",
+            context: None,
         });
         return;
     };
@@ -321,7 +347,22 @@ async fn execute_live(
     let Some((ask, shares)) =
         revalidate_entry(book, executed_at_ms, &market_clock, &config, signal.side)
     else {
-        reject(signal, "entry_revalidation", &engine_state, &audit);
+        let revalidation_market = market_rx.borrow().clone();
+        reject_with_context(
+            signal,
+            "entry_revalidation",
+            &engine_state,
+            &audit,
+            Some(audit_context(
+                book,
+                executed_at_ms,
+                signal.side,
+                revalidation_market.as_ref(),
+                Some(config.entry_slippage),
+                None,
+                None,
+            )),
+        );
         return;
     };
     let Some(active_market) = market_rx.borrow().clone() else {
@@ -329,8 +370,8 @@ async fn execute_live(
         return;
     };
     let token_id_text = match signal.side {
-        OrderSide::BuyYes => active_market.yes_asset_id,
-        OrderSide::BuyNo => active_market.no_asset_id,
+        OrderSide::BuyYes => active_market.yes_asset_id.clone(),
+        OrderSide::BuyNo => active_market.no_asset_id.clone(),
     };
     let token_id = match U256::from_str(&token_id_text) {
         Ok(token_id) => token_id,
@@ -342,6 +383,15 @@ async fn execute_live(
     };
 
     let entry_limit_price = (ask + config.entry_slippage).min(0.95);
+    let entry_context = audit_context(
+        book,
+        executed_at_ms,
+        signal.side,
+        Some(&active_market),
+        Some(config.entry_slippage),
+        Some(entry_limit_price),
+        Some(shares),
+    );
     let entry_response = match live_executor
         .buy_shares(token_id, shares, entry_limit_price)
         .await
@@ -350,7 +400,13 @@ async fn execute_live(
         Err(error) => {
             let error_chain = format!("{error:#}");
             warn!(%error_chain, side = signal.side.as_str(), shares, entry_limit_price, "Live entry failed");
-            reject(signal, "live_entry_failed", &engine_state, &audit);
+            reject_with_context(
+                signal,
+                "live_entry_failed",
+                &engine_state,
+                &audit,
+                Some(entry_context),
+            );
             return;
         }
     };
@@ -362,7 +418,13 @@ async fn execute_live(
             shares,
             "Live entry rejected"
         );
-        reject(signal, "live_entry_rejected", &engine_state, &audit);
+        reject_with_context(
+            signal,
+            "live_entry_rejected",
+            &engine_state,
+            &audit,
+            Some(entry_context),
+        );
         return;
     }
 
@@ -372,7 +434,13 @@ async fn execute_live(
             side = signal.side.as_str(),
             shares, "Live entry produced zero fill"
         );
-        reject(signal, "live_entry_zero_fill", &engine_state, &audit);
+        reject_with_context(
+            signal,
+            "live_entry_zero_fill",
+            &engine_state,
+            &audit,
+            Some(entry_context),
+        );
         return;
     }
 
@@ -390,17 +458,28 @@ async fn execute_live(
         price: round_5(entry_price),
         shares: round_5(filled_shares),
         notional_usd: round_5(entry_price * filled_shares),
+        context: Some(entry_context),
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(signal.hold_ms)).await;
     let exit_at_ms = now_ms();
     let book = book_state.load();
+    let exit_context = audit_context(
+        book,
+        exit_at_ms,
+        signal.side,
+        Some(&active_market),
+        None,
+        None,
+        None,
+    );
     if exit_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_stale_book_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     }
@@ -410,6 +489,7 @@ async fn execute_live(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_missing_bid_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     };
@@ -421,6 +501,7 @@ async fn execute_live(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_unsellable_amount_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     }
@@ -435,6 +516,7 @@ async fn execute_live(
                 signal_ts_ms: signal.signal_ts_ms,
                 side: signal.side.as_str(),
                 reason: "live_exit_failed_position_open",
+                context: Some(exit_context.clone()),
             });
             return;
         }
@@ -453,6 +535,7 @@ async fn execute_live(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_rejected_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     }
@@ -464,6 +547,7 @@ async fn execute_live(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_zero_fill_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     }
@@ -473,6 +557,7 @@ async fn execute_live(
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_partial_fill_position_open",
+            context: Some(exit_context.clone()),
         });
         return;
     }
@@ -537,7 +622,61 @@ fn reject(
         signal_ts_ms: signal.signal_ts_ms,
         side: signal.side.as_str(),
         reason,
+        context: None,
     });
+}
+
+fn reject_with_context(
+    signal: OrderSignal,
+    reason: &'static str,
+    engine_state: &EngineState,
+    audit: &AuditEmitter,
+    context: Option<AuditBookContext>,
+) {
+    engine_state.release_reservation();
+    let _ = audit.emit(AuditEvent::ExecutionRejected {
+        signal_ts_ms: signal.signal_ts_ms,
+        side: signal.side.as_str(),
+        reason,
+        context,
+    });
+}
+
+fn audit_context(
+    book: BookSnapshot,
+    now_ms: u64,
+    side: OrderSide,
+    market: Option<&ActiveMarket>,
+    entry_slippage: Option<f64>,
+    entry_limit_price: Option<f64>,
+    intended_shares: Option<u64>,
+) -> AuditBookContext {
+    let selected = outcome_book(book, side);
+    let token_id = market.map(|market| match side {
+        OrderSide::BuyYes => market.yes_asset_id.clone(),
+        OrderSide::BuyNo => market.no_asset_id.clone(),
+    });
+    let intended_notional_usd = intended_shares.map(|shares| {
+        round_5(shares as f64 * entry_limit_price.or(selected.ask).unwrap_or_default())
+    });
+
+    AuditBookContext {
+        market_slug: market.map(|market| market.slug.clone()),
+        token_id,
+        yes_bid: book.yes.bid.map(round_5),
+        yes_ask: book.yes.ask.map(round_5),
+        no_bid: book.no.bid.map(round_5),
+        no_ask: book.no.ask.map(round_5),
+        book_received_at_ms: book.received_at_ms,
+        book_source_ts_ms: book.source_ts_ms,
+        book_age_ms: now_ms.saturating_sub(book.received_at_ms),
+        selected_bid: selected.bid.map(round_5),
+        selected_ask: selected.ask.map(round_5),
+        entry_slippage: entry_slippage.map(round_5),
+        entry_limit_price: entry_limit_price.map(round_5),
+        intended_shares,
+        intended_notional_usd,
+    }
 }
 
 fn outcome_book(snapshot: BookSnapshot, side: OrderSide) -> OutcomeBook {
