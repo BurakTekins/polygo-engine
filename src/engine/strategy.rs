@@ -95,6 +95,7 @@ mod tests {
             execution_latency_ms: 100,
             hold_ms: 5_000,
             min_expected_price_move: 0.05,
+            entry_slippage: 0.02,
             min_market_progress: 0.05,
             max_market_progress: 0.90,
             max_book_age_ms: 300,

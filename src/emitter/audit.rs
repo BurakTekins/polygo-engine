@@ -61,7 +61,7 @@ pub enum AuditEvent {
         order_id: String,
         order_status: String,
         price: f64,
-        shares: u64,
+        shares: f64,
         notional_usd: f64,
     },
     LiveExit {
@@ -73,7 +73,7 @@ pub enum AuditEvent {
         order_status: String,
         entry_price: f64,
         exit_price: f64,
-        shares: u64,
+        shares: f64,
         gross_pnl: f64,
         entry_fee: f64,
         exit_fee: f64,

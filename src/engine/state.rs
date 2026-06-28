@@ -11,6 +11,17 @@ pub struct ClosedPosition {
     pub net_pnl: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClosedLivePosition {
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub shares: f64,
+    pub gross_pnl: f64,
+    pub entry_fee: f64,
+    pub exit_fee: f64,
+    pub net_pnl: f64,
+}
+
 #[derive(Debug)]
 pub struct EngineState {
     open_or_reserved: AtomicUsize,
@@ -70,12 +81,7 @@ impl EngineState {
         let entry_fee = taker_fee(shares, entry_price);
         let exit_fee = taker_fee(shares, exit_price);
         let net_pnl = round_5(gross_pnl - entry_fee - exit_fee);
-        if net_pnl < 0.0 {
-            self.daily_loss_microusd
-                .fetch_add(to_microusd(net_pnl.abs()), Ordering::AcqRel);
-        }
-        add_signed_microusd(&self.total_pnl_microusd, net_pnl);
-        self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+        self.record_close(net_pnl);
         ClosedPosition {
             entry_price,
             exit_price,
@@ -86,10 +92,40 @@ impl EngineState {
             net_pnl,
         }
     }
+
+    pub fn close_live(&self, entry_price: f64, exit_price: f64, shares: f64) -> ClosedLivePosition {
+        let gross_pnl = round_5((exit_price - entry_price) * shares);
+        let entry_fee = taker_fee_decimal(shares, entry_price);
+        let exit_fee = taker_fee_decimal(shares, exit_price);
+        let net_pnl = round_5(gross_pnl - entry_fee - exit_fee);
+        self.record_close(net_pnl);
+        ClosedLivePosition {
+            entry_price,
+            exit_price,
+            shares: round_5(shares),
+            gross_pnl,
+            entry_fee,
+            exit_fee,
+            net_pnl,
+        }
+    }
+
+    fn record_close(&self, net_pnl: f64) {
+        if net_pnl < 0.0 {
+            self.daily_loss_microusd
+                .fetch_add(to_microusd(net_pnl.abs()), Ordering::AcqRel);
+        }
+        add_signed_microusd(&self.total_pnl_microusd, net_pnl);
+        self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub fn taker_fee(shares: u64, price: f64) -> f64 {
-    round_5(shares as f64 * 0.07 * price * (1.0 - price))
+    taker_fee_decimal(shares as f64, price)
+}
+
+pub fn taker_fee_decimal(shares: f64, price: f64) -> f64 {
+    round_5(shares * 0.07 * price * (1.0 - price))
 }
 
 pub fn round_5(value: f64) -> f64 {

@@ -83,25 +83,32 @@ impl LiveExecutor {
         Ok(Self { client, signer })
     }
 
-    async fn buy_shares(&self, token_id: U256, shares: u64) -> Result<PostOrderResponse> {
+    async fn buy_shares(
+        &self,
+        token_id: U256,
+        shares: u64,
+        limit_price: f64,
+    ) -> Result<PostOrderResponse> {
         self.client
             .market_order()
             .token_id(token_id)
             .side(ClobSide::Buy)
             .amount(Amount::shares(Decimal::from(shares))?)
-            .order_type(OrderType::FOK)
+            .price(decimal_from_f64(limit_price)?)
+            .order_type(OrderType::FAK)
             .build_sign_and_post(&self.signer)
             .await
             .context("Polymarket buy order failed")
     }
 
-    async fn sell_shares(&self, token_id: U256, shares: u64) -> Result<PostOrderResponse> {
+    async fn sell_shares(&self, token_id: U256, shares: f64) -> Result<PostOrderResponse> {
+        let sellable_shares = floor_to_2_decimals(shares);
         self.client
             .market_order()
             .token_id(token_id)
             .side(ClobSide::Sell)
-            .amount(Amount::shares(Decimal::from(shares))?)
-            .order_type(OrderType::FOK)
+            .amount(Amount::shares(decimal_from_f64(sellable_shares)?)?)
+            .order_type(OrderType::FAK)
             .build_sign_and_post(&self.signer)
             .await
             .context("Polymarket sell order failed")
@@ -334,11 +341,15 @@ async fn execute_live(
         }
     };
 
-    let entry_response = match live_executor.buy_shares(token_id, shares).await {
+    let entry_limit_price = (ask + config.entry_slippage).min(0.95);
+    let entry_response = match live_executor
+        .buy_shares(token_id, shares, entry_limit_price)
+        .await
+    {
         Ok(response) => response,
         Err(error) => {
             let error_chain = format!("{error:#}");
-            warn!(%error_chain, side = signal.side.as_str(), shares, "Live entry failed");
+            warn!(%error_chain, side = signal.side.as_str(), shares, entry_limit_price, "Live entry failed");
             reject(signal, "live_entry_failed", &engine_state, &audit);
             return;
         }
@@ -355,6 +366,16 @@ async fn execute_live(
         return;
     }
 
+    let filled_shares = buy_shares_filled(&entry_response).unwrap_or(0.0);
+    if filled_shares <= 0.0 {
+        warn!(
+            side = signal.side.as_str(),
+            shares, "Live entry produced zero fill"
+        );
+        reject(signal, "live_entry_zero_fill", &engine_state, &audit);
+        return;
+    }
+
     let entry_price = buy_price(&entry_response).unwrap_or(ask);
     let position_id = engine_state.open_reserved();
     let _ = audit.emit(AuditEvent::LiveEntry {
@@ -367,8 +388,8 @@ async fn execute_live(
         order_id: entry_response.order_id.clone(),
         order_status: entry_response.status.to_string(),
         price: round_5(entry_price),
-        shares,
-        notional_usd: round_5(entry_price * shares as f64),
+        shares: round_5(filled_shares),
+        notional_usd: round_5(entry_price * filled_shares),
     });
 
     tokio::time::sleep(tokio::time::Duration::from_millis(signal.hold_ms)).await;
@@ -393,11 +414,22 @@ async fn execute_live(
         return;
     };
 
-    let exit_response = match live_executor.sell_shares(token_id, shares).await {
+    let sellable_shares = floor_to_2_decimals(filled_shares);
+    if sellable_shares <= 0.0 {
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_unsellable_amount_position_open",
+        });
+        return;
+    }
+
+    let exit_response = match live_executor.sell_shares(token_id, sellable_shares).await {
         Ok(response) => response,
         Err(error) => {
             let error_chain = format!("{error:#}");
-            warn!(%error_chain, side = signal.side.as_str(), shares, "Live exit failed; position may remain open");
+            warn!(%error_chain, side = signal.side.as_str(), shares = sellable_shares, filled_shares, "Live exit failed; position may remain open");
             health.trip(5);
             let _ = audit.emit(AuditEvent::ExecutionRejected {
                 signal_ts_ms: signal.signal_ts_ms,
@@ -412,7 +444,8 @@ async fn execute_live(
             status = %exit_response.status,
             error = ?exit_response.error_msg,
             side = signal.side.as_str(),
-            shares,
+            shares = sellable_shares,
+            filled_shares,
             "Live exit rejected; position may remain open"
         );
         health.trip(5);
@@ -424,8 +457,28 @@ async fn execute_live(
         return;
     }
 
+    let sold_shares = sell_shares_filled(&exit_response).unwrap_or(0.0);
+    if sold_shares <= 0.0 {
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_zero_fill_position_open",
+        });
+        return;
+    }
+    if sold_shares + 0.00001 < sellable_shares {
+        health.trip(5);
+        let _ = audit.emit(AuditEvent::ExecutionRejected {
+            signal_ts_ms: signal.signal_ts_ms,
+            side: signal.side.as_str(),
+            reason: "live_exit_partial_fill_position_open",
+        });
+        return;
+    }
+
     let exit_price = sell_price(&exit_response).unwrap_or(exit_bid);
-    let closed = engine_state.close(entry_price, exit_price, shares);
+    let closed = engine_state.close_live(entry_price, exit_price, sold_shares);
     let _ = audit.emit(AuditEvent::LiveExit {
         position_id,
         closed_at_ms: exit_at_ms,
@@ -435,7 +488,7 @@ async fn execute_live(
         order_status: exit_response.status.to_string(),
         entry_price: round_5(entry_price),
         exit_price: round_5(exit_price),
-        shares,
+        shares: closed.shares,
         gross_pnl: closed.gross_pnl,
         entry_fee: closed.entry_fee,
         exit_fee: closed.exit_fee,
@@ -526,12 +579,28 @@ fn sell_price(response: &PostOrderResponse) -> Option<f64> {
     price_ratio(response.taking_amount, response.making_amount)
 }
 
+fn buy_shares_filled(response: &PostOrderResponse) -> Option<f64> {
+    decimal_to_f64(response.taking_amount)
+}
+
+fn sell_shares_filled(response: &PostOrderResponse) -> Option<f64> {
+    decimal_to_f64(response.making_amount)
+}
+
 fn price_ratio(numerator: Decimal, denominator: Decimal) -> Option<f64> {
     let denominator = decimal_to_f64(denominator)?;
     if denominator <= 0.0 {
         return None;
     }
     Some(decimal_to_f64(numerator)? / denominator)
+}
+
+fn decimal_from_f64(value: f64) -> Result<Decimal> {
+    Decimal::from_str(&round_5(value).to_string()).context("invalid decimal amount")
+}
+
+fn floor_to_2_decimals(value: f64) -> f64 {
+    (value * 100.0).floor() / 100.0
 }
 
 fn decimal_to_f64(value: Decimal) -> Option<f64> {

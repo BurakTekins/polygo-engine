@@ -46,6 +46,7 @@ pub struct StrategyConfig {
     pub execution_latency_ms: u64,
     pub hold_ms: u64,
     pub min_expected_price_move: f64,
+    pub entry_slippage: f64,
     pub min_market_progress: f64,
     pub max_market_progress: f64,
     pub max_book_age_ms: u64,
@@ -99,6 +100,8 @@ impl EngineConfig {
             || strategy.hold_ms == 0
             || !strategy.min_expected_price_move.is_finite()
             || strategy.min_expected_price_move < 0.0
+            || !strategy.entry_slippage.is_finite()
+            || !(0.0..=0.20).contains(&strategy.entry_slippage)
             || !(0.0..1.0).contains(&strategy.min_market_progress)
             || !(0.0..=1.0).contains(&strategy.max_market_progress)
             || strategy.min_market_progress >= strategy.max_market_progress
