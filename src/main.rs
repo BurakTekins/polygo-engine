@@ -40,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let audit = AuditEmitter::new(
         config.integration.java_audit_endpoint.clone(),
         Arc::clone(&health),
+        Arc::clone(&strategy_store),
         execution_mode.as_str(),
     );
     let (market_tx, market_rx) = watch::channel::<Option<ActiveMarket>>(None);

@@ -9,6 +9,7 @@ use crate::engine::state::ClosedPosition;
 use crate::executor::order::OrderSignal;
 use crate::health::HealthState;
 use crate::market::now_ms;
+use crate::runtime_config::StrategyStore;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditBookContext {
@@ -43,6 +44,7 @@ pub struct AuditEnvelope {
     pub source: &'static str,
     pub execution_mode: &'static str,
     pub emitted_at_ms: u64,
+    pub config_version: Option<String>,
     #[serde(flatten)]
     pub event: AuditEvent,
 }
@@ -156,6 +158,7 @@ impl AuditEmitter {
     pub fn new(
         endpoint: Option<String>,
         health: Arc<HealthState>,
+        strategy_store: Arc<StrategyStore>,
         execution_mode: &'static str,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<AuditEvent>(1_024);
@@ -175,6 +178,7 @@ impl AuditEmitter {
                     source: "polygo-engine",
                     execution_mode,
                     emitted_at_ms: now_ms(),
+                    config_version: strategy_store.version().ok().flatten(),
                     event,
                 };
                 let payload = match serde_json::to_vec(&envelope) {

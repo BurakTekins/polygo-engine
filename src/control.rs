@@ -350,7 +350,7 @@ mod tests {
             )
             .await
             .status,
-            409
+            204
         );
         let configured = request(address, "GET", "/v1/health", None).await;
         assert_eq!(configured.json["configVersion"], "momentum-v1");
