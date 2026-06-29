@@ -26,6 +26,8 @@ use crate::runtime_config::{StrategySnapshot, StrategyStore};
 use crate::ws::polymarket::{BookSnapshot, BookState, OutcomeBook};
 
 const DEFAULT_CLOB_API_URL: &str = "https://clob-v2.polymarket.com";
+const LIVE_EXIT_MAX_ATTEMPTS: u32 = 40;
+const LIVE_EXIT_RETRY_MS: u64 = 250;
 
 type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
 
@@ -400,12 +402,14 @@ async fn execute_live(
         Err(error) => {
             let error_chain = format!("{error:#}");
             warn!(%error_chain, side = signal.side.as_str(), shares, entry_limit_price, "Live entry failed");
+            let mut rejected_context = entry_context;
+            rejected_context.exchange_error = Some(error_chain);
             reject_with_context(
                 signal,
                 "live_entry_failed",
                 &engine_state,
                 &audit,
-                Some(entry_context),
+                Some(rejected_context),
             );
             return;
         }
@@ -418,12 +422,14 @@ async fn execute_live(
             shares,
             "Live entry rejected"
         );
+        let mut rejected_context = entry_context;
+        rejected_context.exchange_error = entry_response.error_msg.clone();
         reject_with_context(
             signal,
             "live_entry_rejected",
             &engine_state,
             &audit,
-            Some(entry_context),
+            Some(rejected_context),
         );
         return;
     }
@@ -506,63 +512,79 @@ async fn execute_live(
         return;
     }
 
-    let exit_response = match live_executor.sell_shares(token_id, sellable_shares).await {
-        Ok(response) => response,
-        Err(error) => {
-            let error_chain = format!("{error:#}");
-            warn!(%error_chain, side = signal.side.as_str(), shares = sellable_shares, filled_shares, "Live exit failed; position may remain open");
-            health.trip(5);
-            let _ = audit.emit(AuditEvent::ExecutionRejected {
-                signal_ts_ms: signal.signal_ts_ms,
-                side: signal.side.as_str(),
-                reason: "live_exit_failed_position_open",
-                context: Some(exit_context.clone()),
-            });
-            return;
+    let mut sold_shares = 0.0;
+    let mut sale_proceeds = 0.0;
+    let mut last_response = None;
+    let mut last_error = None;
+    let mut attempts = 0;
+
+    while attempts < LIVE_EXIT_MAX_ATTEMPTS {
+        let remaining_shares = floor_to_2_decimals(sellable_shares - sold_shares);
+        if remaining_shares <= 0.0 {
+            break;
         }
-    };
-    if !exit_response.success {
-        warn!(
-            status = %exit_response.status,
-            error = ?exit_response.error_msg,
-            side = signal.side.as_str(),
-            shares = sellable_shares,
-            filled_shares,
-            "Live exit rejected; position may remain open"
-        );
+        attempts += 1;
+        match live_executor.sell_shares(token_id, remaining_shares).await {
+            Ok(response) if response.success => {
+                let filled = sell_shares_filled(&response)
+                    .unwrap_or(0.0)
+                    .min(remaining_shares);
+                if filled > 0.0 {
+                    let fill_price = sell_price(&response).unwrap_or(exit_bid);
+                    sold_shares += filled;
+                    sale_proceeds += filled * fill_price;
+                    last_response = Some(response);
+                }
+            }
+            Ok(response) => {
+                let error = response.error_msg.clone().unwrap_or_else(|| response.status.to_string());
+                if !is_no_match_error(&error) {
+                    last_error = Some(error);
+                    break;
+                }
+                last_error = Some(error);
+            }
+            Err(error) => {
+                let error_chain = format!("{error:#}");
+                if !is_no_match_error(&error_chain) {
+                    last_error = Some(error_chain);
+                    break;
+                }
+                last_error = Some(error_chain);
+            }
+        }
+        if floor_to_2_decimals(sellable_shares - sold_shares) > 0.0 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(LIVE_EXIT_RETRY_MS)).await;
+        }
+    }
+
+    if sold_shares + 0.00001 < sellable_shares {
+        warn!(side = signal.side.as_str(), sold_shares, sellable_shares, attempts, error = ?last_error, "Live exit retries exhausted; position remains open");
         health.trip(5);
+        let mut rejected_context = exit_context;
+        rejected_context.exchange_error = last_error;
+        rejected_context.filled_shares = Some(round_5(sold_shares));
+        rejected_context.exit_attempts = Some(attempts);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
-            reason: "live_exit_rejected_position_open",
-            context: Some(exit_context.clone()),
+            reason: "live_exit_retry_exhausted_position_open",
+            context: Some(rejected_context),
         });
         return;
     }
 
-    let sold_shares = sell_shares_filled(&exit_response).unwrap_or(0.0);
-    if sold_shares <= 0.0 {
+    let Some(exit_response) = last_response else {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
             reason: "live_exit_zero_fill_position_open",
-            context: Some(exit_context.clone()),
+            context: Some(exit_context),
         });
         return;
-    }
-    if sold_shares + 0.00001 < sellable_shares {
-        health.trip(5);
-        let _ = audit.emit(AuditEvent::ExecutionRejected {
-            signal_ts_ms: signal.signal_ts_ms,
-            side: signal.side.as_str(),
-            reason: "live_exit_partial_fill_position_open",
-            context: Some(exit_context.clone()),
-        });
-        return;
-    }
-
-    let exit_price = sell_price(&exit_response).unwrap_or(exit_bid);
+    };
+    let exit_price = sale_proceeds / sold_shares;
     let closed = engine_state.close_live(entry_price, exit_price, sold_shares);
     let _ = audit.emit(AuditEvent::LiveExit {
         position_id,
@@ -676,7 +698,14 @@ fn audit_context(
         entry_limit_price: entry_limit_price.map(round_5),
         intended_shares,
         intended_notional_usd,
+        exchange_error: None,
+        filled_shares: None,
+        exit_attempts: None,
     }
+}
+
+fn is_no_match_error(error: &str) -> bool {
+    error.contains("no orders found to match with FAK order")
 }
 
 fn outcome_book(snapshot: BookSnapshot, side: OrderSide) -> OutcomeBook {

@@ -36,6 +36,12 @@ pub struct AuditBookContext {
     pub intended_shares: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intended_notional_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filled_shares: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_attempts: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
