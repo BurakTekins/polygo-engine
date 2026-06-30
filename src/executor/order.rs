@@ -23,11 +23,19 @@ use crate::engine::state::{round_5, EngineState};
 use crate::health::HealthState;
 use crate::market::{now_ms, ActiveMarket, MarketClock};
 use crate::runtime_config::{StrategySnapshot, StrategyStore};
-use crate::ws::polymarket::{BookSnapshot, BookState, OutcomeBook};
+use crate::ws::polymarket::{BookSnapshot, BookState, DepthSnapshot, OutcomeBook};
 
 const DEFAULT_CLOB_API_URL: &str = "https://clob-v2.polymarket.com";
 const LIVE_EXIT_MAX_ATTEMPTS: u32 = 40;
 const LIVE_EXIT_RETRY_MS: u64 = 250;
+const ENTRY_DEPTH_MULTIPLIER: f64 = 1.25;
+const LIVE_EXIT_GTC_REPRICE_ATTEMPTS: u32 = 3;
+const LIVE_EXIT_GTC_POLLS_PER_PRICE: u32 = 8;
+const LIVE_EXIT_GTC_FINAL_POLLS: u32 = 1_200;
+const LIVE_EXIT_GTC_POLL_MS: u64 = 250;
+const LIVE_EXIT_GTC_FLOOR_PRICE: f64 = 0.01;
+const LIVE_ENTRY_GTC_POLLS: u32 = 8;
+const LIVE_ENTRY_GTC_POLL_MS: u64 = 250;
 
 type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
 
@@ -85,24 +93,6 @@ impl LiveExecutor {
         Ok(Self { client, signer })
     }
 
-    async fn buy_shares(
-        &self,
-        token_id: U256,
-        shares: u64,
-        limit_price: f64,
-    ) -> Result<PostOrderResponse> {
-        self.client
-            .market_order()
-            .token_id(token_id)
-            .side(ClobSide::Buy)
-            .amount(Amount::shares(Decimal::from(shares))?)
-            .price(decimal_from_f64(limit_price)?)
-            .order_type(OrderType::FAK)
-            .build_sign_and_post(&self.signer)
-            .await
-            .context("Polymarket buy order failed")
-    }
-
     async fn sell_shares(&self, token_id: U256, shares: f64) -> Result<PostOrderResponse> {
         let sellable_shares = floor_to_2_decimals(shares);
         self.client
@@ -115,6 +105,60 @@ impl LiveExecutor {
             .await
             .context("Polymarket sell order failed")
     }
+
+    async fn place_gtc_buy(
+        &self,
+        token_id: U256,
+        shares: u64,
+        limit_price: f64,
+    ) -> Result<PostOrderResponse> {
+        self.client
+            .limit_order()
+            .token_id(token_id)
+            .side(ClobSide::Buy)
+            .price(decimal_from_f64(limit_price)?)
+            .size(Decimal::from(shares))
+            .order_type(OrderType::GTC)
+            .build_sign_and_post(&self.signer)
+            .await
+            .context("Polymarket GTC buy order failed")
+    }
+
+    async fn place_gtc_sell(
+        &self,
+        token_id: U256,
+        shares: f64,
+        limit_price: f64,
+    ) -> Result<PostOrderResponse> {
+        self.client
+            .limit_order()
+            .token_id(token_id)
+            .side(ClobSide::Sell)
+            .price(decimal_from_f64(limit_price)?)
+            .size(decimal_from_f64(shares)?)
+            .order_type(OrderType::GTC)
+            .build_sign_and_post(&self.signer)
+            .await
+            .context("Polymarket GTC sell order failed")
+    }
+}
+
+struct GtcExitResult {
+    sold_shares: f64,
+    sale_proceeds: f64,
+    order_id: Option<String>,
+    order_status: Option<String>,
+    error: Option<String>,
+    pending: bool,
+}
+
+struct GtcEntryResult {
+    filled_shares: f64,
+    notional_usd: f64,
+    order_id: Option<String>,
+    order_status: Option<String>,
+    error: Option<String>,
+    pending: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,7 +429,7 @@ async fn execute_live(
     };
 
     let entry_limit_price = (ask + config.entry_slippage).min(0.95);
-    let entry_context = audit_context(
+    let mut entry_context = audit_context(
         book,
         executed_at_ms,
         signal.side,
@@ -394,63 +438,51 @@ async fn execute_live(
         Some(entry_limit_price),
         Some(shares),
     );
-    let entry_response = match live_executor
-        .buy_shares(token_id, shares, entry_limit_price)
-        .await
+    let depth = book_state.load_depth();
+    let available_shares = executable_ask_shares(&depth, signal.side, entry_limit_price);
+    let required_shares = shares as f64 * ENTRY_DEPTH_MULTIPLIER;
+    entry_context.available_shares = Some(round_5(available_shares));
+    entry_context.required_shares = Some(round_5(required_shares));
+    if executed_at_ms.saturating_sub(depth.received_at_ms) > config.max_book_age_ms
+        || available_shares + 0.00001 < required_shares
     {
-        Ok(response) => response,
-        Err(error) => {
-            let error_chain = format!("{error:#}");
-            warn!(%error_chain, side = signal.side.as_str(), shares, entry_limit_price, "Live entry failed");
-            let mut rejected_context = entry_context;
-            rejected_context.exchange_error = Some(error_chain);
-            reject_with_context(
-                signal,
-                "live_entry_failed",
-                &engine_state,
-                &audit,
-                Some(rejected_context),
-            );
-            return;
-        }
-    };
-    if !entry_response.success {
-        warn!(
-            status = %entry_response.status,
-            error = ?entry_response.error_msg,
-            side = signal.side.as_str(),
-            shares,
-            "Live entry rejected"
-        );
-        let mut rejected_context = entry_context;
-        rejected_context.exchange_error = entry_response.error_msg.clone();
         reject_with_context(
             signal,
-            "live_entry_rejected",
-            &engine_state,
-            &audit,
-            Some(rejected_context),
-        );
-        return;
-    }
-
-    let filled_shares = buy_shares_filled(&entry_response).unwrap_or(0.0);
-    if filled_shares <= 0.0 {
-        warn!(
-            side = signal.side.as_str(),
-            shares, "Live entry produced zero fill"
-        );
-        reject_with_context(
-            signal,
-            "live_entry_zero_fill",
+            "insufficient_entry_depth",
             &engine_state,
             &audit,
             Some(entry_context),
         );
         return;
     }
+    let entry = buy_with_gtc_limit(&live_executor, token_id, shares, entry_limit_price).await;
+    entry_context.fallback_order_id = entry.order_id.clone();
+    entry_context.exchange_error = entry.error.clone();
+    if entry.filled_shares <= 0.0 {
+        warn!(side = signal.side.as_str(), shares, entry_limit_price, error = ?entry.error, pending = entry.pending, "Live GTC entry produced zero fill");
+        reject_with_context(
+            signal,
+            if entry.pending {
+                "live_entry_gtc_pending"
+            } else {
+                "live_entry_zero_fill"
+            },
+            &engine_state,
+            &audit,
+            Some(entry_context),
+        );
+        return;
+    }
+    if entry.pending {
+        warn!(side = signal.side.as_str(), filled_shares = entry.filled_shares, shares, entry_limit_price, order_id = ?entry.order_id, "Live GTC entry has an unconfirmed open order");
+        health.trip(5);
+    }
 
-    let entry_price = buy_price(&entry_response).unwrap_or(ask);
+    let filled_shares = entry.filled_shares;
+    let entry_notional_usd = entry.notional_usd;
+    let entry_order_id = entry.order_id.unwrap_or_default();
+    let entry_order_status = entry.order_status.unwrap_or_else(|| "UNKNOWN".to_owned());
+    let entry_price = entry_notional_usd / filled_shares;
     let position_id = engine_state.open_reserved();
     let _ = audit.emit(AuditEvent::LiveEntry {
         position_id,
@@ -459,11 +491,11 @@ async fn execute_live(
         latency_ms: executed_at_ms.saturating_sub(signal.signal_ts_ms),
         side: signal.side.as_str(),
         token_id: token_id_text.clone(),
-        order_id: entry_response.order_id.clone(),
-        order_status: entry_response.status.to_string(),
+        order_id: entry_order_id,
+        order_status: entry_order_status,
         price: round_5(entry_price),
         shares: round_5(filled_shares),
-        notional_usd: round_5(entry_price * filled_shares),
+        notional_usd: round_5(entry_notional_usd),
         context: Some(entry_context),
     });
 
@@ -558,23 +590,57 @@ async fn execute_live(
         }
     }
 
+    let mut fallback_order_id = None;
+    let mut fallback_order_status = None;
+    let mut fallback_pending = false;
     if sold_shares + 0.00001 < sellable_shares {
-        warn!(side = signal.side.as_str(), sold_shares, sellable_shares, attempts, error = ?last_error, "Live exit retries exhausted; position remains open");
+        let fallback = sell_with_gtc_fallback(
+            &live_executor,
+            token_id,
+            sellable_shares - sold_shares,
+            signal.side,
+            &book_state,
+        )
+        .await;
+        sold_shares += fallback.sold_shares;
+        sale_proceeds += fallback.sale_proceeds;
+        fallback_order_id = fallback.order_id;
+        fallback_order_status = fallback.order_status;
+        fallback_pending = fallback.pending;
+        if fallback.error.is_some() {
+            last_error = fallback.error;
+        }
+    }
+
+    if sold_shares + 0.00001 < sellable_shares {
+        warn!(side = signal.side.as_str(), sold_shares, sellable_shares, attempts, error = ?last_error, fallback_pending, "Live exit fallback incomplete; position remains open");
         health.trip(5);
         let mut rejected_context = exit_context;
         rejected_context.exchange_error = last_error;
         rejected_context.filled_shares = Some(round_5(sold_shares));
         rejected_context.exit_attempts = Some(attempts);
+        rejected_context.fallback_order_id = fallback_order_id;
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
-            reason: "live_exit_retry_exhausted_position_open",
+            reason: if fallback_pending {
+                "live_exit_gtc_pending_position_open"
+            } else {
+                "live_exit_gtc_failed_position_open"
+            },
             context: Some(rejected_context),
         });
         return;
     }
 
-    let Some(exit_response) = last_response else {
+    let exit_order = fallback_order_id
+        .zip(fallback_order_status)
+        .or_else(|| {
+            last_response.as_ref().map(|response| {
+                (response.order_id.clone(), response.status.to_string())
+            })
+        });
+    let Some((exit_order_id, exit_order_status)) = exit_order else {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
@@ -588,11 +654,11 @@ async fn execute_live(
     let closed = engine_state.close_live(entry_price, exit_price, sold_shares);
     let _ = audit.emit(AuditEvent::LiveExit {
         position_id,
-        closed_at_ms: exit_at_ms,
+        closed_at_ms: now_ms(),
         side: signal.side.as_str(),
         token_id: token_id_text,
-        order_id: exit_response.order_id.clone(),
-        order_status: exit_response.status.to_string(),
+        order_id: exit_order_id,
+        order_status: exit_order_status,
         entry_price: round_5(entry_price),
         exit_price: round_5(exit_price),
         shares: closed.shares,
@@ -601,6 +667,239 @@ async fn execute_live(
         exit_fee: closed.exit_fee,
         net_pnl: closed.net_pnl,
     });
+}
+
+async fn buy_with_gtc_limit(
+    live_executor: &LiveExecutor,
+    token_id: U256,
+    shares: u64,
+    limit_price: f64,
+) -> GtcEntryResult {
+    let mut result = GtcEntryResult {
+        filled_shares: 0.0,
+        notional_usd: 0.0,
+        order_id: None,
+        order_status: None,
+        error: None,
+        pending: false,
+    };
+    let response = match live_executor
+        .place_gtc_buy(token_id, shares, limit_price)
+        .await
+    {
+        Ok(response) if response.success => response,
+        Ok(response) => {
+            let status = response.status.to_string();
+            result.error = response.error_msg.or(Some(status));
+            return result;
+        }
+        Err(error) => {
+            result.error = Some(format!("{error:#}"));
+            return result;
+        }
+    };
+
+    let order_id = response.order_id.clone();
+    result.order_id = Some(order_id.clone());
+    result.order_status = Some(response.status.to_string());
+
+    let target_shares = shares as f64;
+    for _ in 0..LIVE_ENTRY_GTC_POLLS {
+        tokio::time::sleep(tokio::time::Duration::from_millis(
+            LIVE_ENTRY_GTC_POLL_MS,
+        ))
+        .await;
+        let order = match live_executor.client.order(&order_id).await {
+            Ok(order) => order,
+            Err(error) => {
+                result.error = Some(format!("GTC entry status failed: {error:#}"));
+                result.pending = true;
+                return result;
+            }
+        };
+        let matched = decimal_to_f64(order.size_matched)
+            .unwrap_or(0.0)
+            .min(target_shares);
+        result.filled_shares = matched;
+        result.notional_usd = matched * limit_price;
+        result.order_status = Some(order.status.to_string());
+        if matched + 0.00001 >= target_shares {
+            return result;
+        }
+    }
+
+    let cancellation = match live_executor.client.cancel_order(&order_id).await {
+        Ok(cancellation) => cancellation,
+        Err(error) => {
+            result.error = Some(format!("GTC entry cancel failed: {error:#}"));
+            result.pending = true;
+            return result;
+        }
+    };
+    let cancellation_confirmed = cancellation
+        .canceled
+        .iter()
+        .any(|canceled_id| canceled_id == &order_id);
+    let final_order = match live_executor.client.order(&order_id).await {
+        Ok(order) => order,
+        Err(error) => {
+            result.error = Some(format!(
+                "GTC entry canceled order fill could not be verified: {error:#}"
+            ));
+            result.pending = !cancellation_confirmed;
+            return result;
+        }
+    };
+    let matched = decimal_to_f64(final_order.size_matched)
+        .unwrap_or(0.0)
+        .min(target_shares);
+    result.filled_shares = matched;
+    result.notional_usd = matched * limit_price;
+    result.order_status = Some(final_order.status.to_string());
+    if !cancellation_confirmed && matched + 0.00001 < target_shares {
+        result.error = Some("GTC entry cancellation was not confirmed".to_owned());
+        result.pending = true;
+    }
+    result
+}
+
+async fn sell_with_gtc_fallback(
+    live_executor: &LiveExecutor,
+    token_id: U256,
+    shares: f64,
+    side: OrderSide,
+    book_state: &BookState,
+) -> GtcExitResult {
+    let target_shares = floor_to_2_decimals(shares);
+    let mut result = GtcExitResult {
+        sold_shares: 0.0,
+        sale_proceeds: 0.0,
+        order_id: None,
+        order_status: None,
+        error: None,
+        pending: false,
+    };
+
+    for price_attempt in 0..=LIVE_EXIT_GTC_REPRICE_ATTEMPTS {
+        let remaining_shares = floor_to_2_decimals(target_shares - result.sold_shares);
+        if remaining_shares <= 0.0 {
+            break;
+        }
+        let is_final_price = price_attempt == LIVE_EXIT_GTC_REPRICE_ATTEMPTS;
+        let limit_price = if is_final_price {
+            LIVE_EXIT_GTC_FLOOR_PRICE
+        } else {
+            outcome_book(book_state.load(), side)
+                .bid
+                .unwrap_or(LIVE_EXIT_GTC_FLOOR_PRICE)
+                .clamp(LIVE_EXIT_GTC_FLOOR_PRICE, 0.99)
+        };
+        let response = match live_executor
+            .place_gtc_sell(token_id, remaining_shares, limit_price)
+            .await
+        {
+            Ok(response) if response.success => response,
+            Ok(response) => {
+                let status = response.status.to_string();
+                result.error = response.error_msg.or(Some(status));
+                return result;
+            }
+            Err(error) => {
+                result.error = Some(format!("{error:#}"));
+                return result;
+            }
+        };
+
+        let order_id = response.order_id.clone();
+        let mut observed_order_fill = sell_shares_filled(&response)
+            .unwrap_or(0.0)
+            .min(remaining_shares);
+        result.sold_shares += observed_order_fill;
+        result.sale_proceeds += observed_order_fill
+            * sell_price(&response).unwrap_or(limit_price);
+        result.order_id = Some(order_id.clone());
+        result.order_status = Some(response.status.to_string());
+        if result.sold_shares + 0.00001 >= target_shares {
+            break;
+        }
+
+        let poll_attempts = if is_final_price {
+            LIVE_EXIT_GTC_FINAL_POLLS
+        } else {
+            LIVE_EXIT_GTC_POLLS_PER_PRICE
+        };
+        for _ in 0..poll_attempts {
+            tokio::time::sleep(tokio::time::Duration::from_millis(
+                LIVE_EXIT_GTC_POLL_MS,
+            ))
+            .await;
+            let order = match live_executor.client.order(&order_id).await {
+                Ok(order) => order,
+                Err(error) => {
+                    result.error = Some(format!("GTC order status failed: {error:#}"));
+                    result.pending = true;
+                    return result;
+                }
+            };
+            let matched = decimal_to_f64(order.size_matched)
+                .unwrap_or(0.0)
+                .min(remaining_shares);
+            let new_fill = (matched - observed_order_fill).max(0.0);
+            observed_order_fill = matched;
+            result.sold_shares += new_fill;
+            result.sale_proceeds += new_fill * limit_price;
+            result.order_status = Some(order.status.to_string());
+            if result.sold_shares + 0.00001 >= target_shares {
+                return result;
+            }
+        }
+
+        if is_final_price {
+            result.pending = true;
+            result.error = Some("GTC floor order is still open".to_owned());
+            return result;
+        }
+
+        let cancellation = match live_executor.client.cancel_order(&order_id).await {
+            Ok(cancellation) => cancellation,
+            Err(error) => {
+                result.error = Some(format!("GTC cancel failed: {error:#}"));
+                result.pending = true;
+                return result;
+            }
+        };
+        let cancellation_confirmed = cancellation
+            .canceled
+            .iter()
+            .any(|canceled_id| canceled_id == &order_id);
+        let final_order = match live_executor.client.order(&order_id).await {
+            Ok(order) => order,
+            Err(error) => {
+                result.error = Some(format!(
+                    "GTC canceled order fill could not be verified: {error:#}"
+                ));
+                result.pending = !cancellation_confirmed;
+                return result;
+            }
+        };
+        let matched = decimal_to_f64(final_order.size_matched)
+            .unwrap_or(0.0)
+            .min(remaining_shares);
+        let new_fill = (matched - observed_order_fill).max(0.0);
+        result.sold_shares += new_fill;
+        result.sale_proceeds += new_fill * limit_price;
+        result.order_status = Some(final_order.status.to_string());
+        if result.sold_shares + 0.00001 >= target_shares {
+            return result;
+        }
+        if !cancellation_confirmed {
+            result.error = Some("GTC cancellation was not confirmed".to_owned());
+            result.pending = true;
+            return result;
+        }
+    }
+
+    result
 }
 
 #[inline]
@@ -698,10 +997,24 @@ fn audit_context(
         entry_limit_price: entry_limit_price.map(round_5),
         intended_shares,
         intended_notional_usd,
+        available_shares: None,
+        required_shares: None,
         exchange_error: None,
         filled_shares: None,
         exit_attempts: None,
+        fallback_order_id: None,
     }
+}
+
+fn executable_ask_shares(depth: &DepthSnapshot, side: OrderSide, limit_price: f64) -> f64 {
+    let asks = match side {
+        OrderSide::BuyYes => &depth.yes.asks,
+        OrderSide::BuyNo => &depth.no.asks,
+    };
+    asks.iter()
+        .filter(|level| level.price <= limit_price)
+        .map(|level| level.size)
+        .sum()
 }
 
 fn is_no_match_error(error: &str) -> bool {
@@ -739,16 +1052,8 @@ fn fee(price: f64, shares: u64) -> f64 {
     shares as f64 * 0.07 * price * (1.0 - price)
 }
 
-fn buy_price(response: &PostOrderResponse) -> Option<f64> {
-    price_ratio(response.making_amount, response.taking_amount)
-}
-
 fn sell_price(response: &PostOrderResponse) -> Option<f64> {
     price_ratio(response.taking_amount, response.making_amount)
-}
-
-fn buy_shares_filled(response: &PostOrderResponse) -> Option<f64> {
-    decimal_to_f64(response.taking_amount)
 }
 
 fn sell_shares_filled(response: &PostOrderResponse) -> Option<f64> {

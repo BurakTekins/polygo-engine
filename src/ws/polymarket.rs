@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +30,26 @@ pub struct BookSnapshot {
     pub source_ts_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DepthLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutcomeDepth {
+    pub bids: Vec<DepthLevel>,
+    pub asks: Vec<DepthLevel>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DepthSnapshot {
+    pub yes: OutcomeDepth,
+    pub no: OutcomeDepth,
+    pub received_at_ms: u64,
+    pub source_ts_ms: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct BookState {
     sequence: AtomicU64,
@@ -39,6 +59,7 @@ pub struct BookState {
     no_ask: AtomicU64,
     received_at_ms: AtomicU64,
     source_ts_ms: AtomicU64,
+    depth: RwLock<DepthSnapshot>,
 }
 
 impl BookState {
@@ -85,6 +106,17 @@ impl BookState {
             }
         }
     }
+
+    pub fn store_depth(&self, snapshot: &DepthSnapshot) {
+        *self.depth.write().unwrap_or_else(|error| error.into_inner()) = snapshot.clone();
+    }
+
+    pub fn load_depth(&self) -> DepthSnapshot {
+        self.depth
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +148,8 @@ enum MarketEvent<'a> {
 struct PriceLevel<'a> {
     #[serde(borrow)]
     price: &'a str,
+    #[serde(borrow)]
+    size: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +160,12 @@ struct PriceChange<'a> {
     best_bid: Option<&'a str>,
     #[serde(default, borrow)]
     best_ask: Option<&'a str>,
+    #[serde(default, borrow)]
+    price: Option<&'a str>,
+    #[serde(default, borrow)]
+    size: Option<&'a str>,
+    #[serde(default, borrow)]
+    side: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,9 +197,11 @@ pub async fn run(
             market_rx.changed().await?;
         };
         let mut snapshot = BookSnapshot::default();
+        let mut depth = DepthSnapshot::default();
         let subscription = serde_json::json!({
             "type": "market",
-            "assets_ids": [&market.yes_asset_id, &market.no_asset_id]
+            "assets_ids": [&market.yes_asset_id, &market.no_asset_id],
+            "custom_feature_enabled": true
         })
         .to_string();
         let mut request = POLYMARKET_WS_URL.into_client_request()?;
@@ -189,15 +231,19 @@ pub async fn run(
                         Ok(Message::Text(text)) if text == "PONG" => {}
                         Ok(Message::Text(text)) => {
                             let received_at_ms = now_ms();
-                            match parse_and_apply(
+                            match parse_and_apply_with_depth(
                                 &text,
                                 &market.yes_asset_id,
                                 &market.no_asset_id,
                                 &mut snapshot,
+                                &mut depth,
                             ) {
                                 Ok(true) => {
                                     snapshot.received_at_ms = received_at_ms;
+                                    depth.received_at_ms = received_at_ms;
+                                    depth.source_ts_ms = snapshot.source_ts_ms;
                                     book_state.store(snapshot);
+                                    book_state.store_depth(&depth);
                                     health.mark_book(received_at_ms);
                                     if snapshot.yes.bid.is_some()
                                         && snapshot.yes.ask.is_some()
@@ -234,15 +280,41 @@ pub fn parse_and_apply(
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
 ) -> Result<bool> {
+    parse_and_apply_inner(raw, yes_asset_id, no_asset_id, snapshot, None)
+}
+
+fn parse_and_apply_with_depth(
+    raw: &str,
+    yes_asset_id: &str,
+    no_asset_id: &str,
+    snapshot: &mut BookSnapshot,
+    depth: &mut DepthSnapshot,
+) -> Result<bool> {
+    parse_and_apply_inner(raw, yes_asset_id, no_asset_id, snapshot, Some(depth))
+}
+
+fn parse_and_apply_inner(
+    raw: &str,
+    yes_asset_id: &str,
+    no_asset_id: &str,
+    snapshot: &mut BookSnapshot,
+    mut depth: Option<&mut DepthSnapshot>,
+) -> Result<bool> {
     let mut changed = false;
     if raw.as_bytes().first() == Some(&b'[') {
         let events: Vec<MarketEvent<'_>> = serde_json::from_str(raw)?;
         for event in events {
-            changed |= apply_event(event, yes_asset_id, no_asset_id, snapshot);
+            changed |= apply_event(
+                event,
+                yes_asset_id,
+                no_asset_id,
+                snapshot,
+                depth.as_deref_mut(),
+            );
         }
     } else {
         let event: MarketEvent<'_> = serde_json::from_str(raw)?;
-        changed = apply_event(event, yes_asset_id, no_asset_id, snapshot);
+        changed = apply_event(event, yes_asset_id, no_asset_id, snapshot, depth);
     }
     Ok(changed)
 }
@@ -252,6 +324,7 @@ fn apply_event(
     yes_asset_id: &str,
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
+    mut depth: Option<&mut DepthSnapshot>,
 ) -> bool {
     match event {
         MarketEvent::Book {
@@ -265,6 +338,13 @@ fn apply_event(
             };
             book.bid = best_price(&bids, f64::max);
             book.ask = best_price(&asks, f64::min);
+            if let Some(depth) = depth.as_deref_mut() {
+                let Some(outcome) = select_depth(asset_id, yes_asset_id, no_asset_id, depth) else {
+                    return false;
+                };
+                outcome.bids = parse_levels(&bids);
+                outcome.asks = parse_levels(&asks);
+            }
             if let Some(timestamp) = timestamp.and_then(|value| value.get()) {
                 snapshot.source_ts_ms = timestamp;
             }
@@ -276,15 +356,45 @@ fn apply_event(
         } => {
             let mut changed = false;
             for change in price_changes {
+                let mut depth_top = None;
+                if let Some(depth) = depth.as_deref_mut() {
+                    if let (Some(price), Some(size), Some(side)) =
+                        (change.price, change.size, change.side)
+                    {
+                        if let (Some(price), Some(size), Some(outcome)) = (
+                            parse_price(price),
+                            parse_size(size),
+                            select_depth(change.asset_id, yes_asset_id, no_asset_id, depth),
+                        ) {
+                            let levels = if side.eq_ignore_ascii_case("BUY") {
+                                &mut outcome.bids
+                            } else if side.eq_ignore_ascii_case("SELL") {
+                                &mut outcome.asks
+                            } else {
+                                continue;
+                            };
+                            update_level(levels, price, size);
+                            depth_top = Some((
+                                best_depth_price(&outcome.bids, f64::max),
+                                best_depth_price(&outcome.asks, f64::min),
+                            ));
+                        }
+                    }
+                }
                 let Some(book) = select_book(change.asset_id, yes_asset_id, no_asset_id, snapshot)
                 else {
                     continue;
                 };
-                if let Some(bid) = change.best_bid {
-                    book.bid = parse_price(bid);
-                }
-                if let Some(ask) = change.best_ask {
-                    book.ask = parse_price(ask);
+                if let Some((bid, ask)) = depth_top {
+                    book.bid = bid;
+                    book.ask = ask;
+                } else {
+                    if let Some(bid) = change.best_bid {
+                        book.bid = parse_price(bid);
+                    }
+                    if let Some(ask) = change.best_ask {
+                        book.ask = parse_price(ask);
+                    }
                 }
                 changed = true;
             }
@@ -294,6 +404,21 @@ fn apply_event(
             changed
         }
         MarketEvent::Other => false,
+    }
+}
+
+fn select_depth<'a>(
+    asset_id: &str,
+    yes_asset_id: &str,
+    no_asset_id: &str,
+    snapshot: &'a mut DepthSnapshot,
+) -> Option<&'a mut OutcomeDepth> {
+    if asset_id == yes_asset_id {
+        Some(&mut snapshot.yes)
+    } else if asset_id == no_asset_id {
+        Some(&mut snapshot.no)
+    } else {
+        None
     }
 }
 
@@ -319,11 +444,46 @@ fn best_price(levels: &[PriceLevel<'_>], select: fn(f64, f64) -> f64) -> Option<
         .reduce(select)
 }
 
+fn best_depth_price(levels: &[DepthLevel], select: fn(f64, f64) -> f64) -> Option<f64> {
+    levels.iter().map(|level| level.price).reduce(select)
+}
+
+fn parse_levels(levels: &[PriceLevel<'_>]) -> Vec<DepthLevel> {
+    levels
+        .iter()
+        .filter_map(|level| {
+            Some(DepthLevel {
+                price: parse_price(level.price)?,
+                size: parse_size(level.size)?,
+            })
+        })
+        .collect()
+}
+
+fn update_level(levels: &mut Vec<DepthLevel>, price: f64, size: f64) {
+    if let Some(index) = levels
+        .iter()
+        .position(|level| (level.price - price).abs() < f64::EPSILON)
+    {
+        if size == 0.0 {
+            levels.swap_remove(index);
+        } else {
+            levels[index].size = size;
+        }
+    } else if size > 0.0 {
+        levels.push(DepthLevel { price, size });
+    }
+}
+
 fn parse_price(value: &str) -> Option<f64> {
     value
         .parse()
         .ok()
         .filter(|price| (0.0..=1.0).contains(price))
+}
+
+fn parse_size(value: &str) -> Option<f64> {
+    value.parse().ok().filter(|size| *size >= 0.0)
 }
 
 fn option_to_bits(value: Option<f64>) -> u64 {
@@ -341,7 +501,7 @@ mod tests {
 
     #[test]
     fn maps_both_outcomes_by_asset_id() {
-        let payload = r#"[{"event_type":"book","asset_id":"yes","bids":[{"price":"0.40"},{"price":"0.42"}],"asks":[{"price":"0.47"},{"price":"0.45"}],"timestamp":"1000"},{"event_type":"book","asset_id":"no","bids":[{"price":"0.53"}],"asks":[{"price":"0.57"}],"timestamp":"1001"}]"#;
+        let payload = r#"[{"event_type":"book","asset_id":"yes","bids":[{"price":"0.40","size":"10"},{"price":"0.42","size":"20"}],"asks":[{"price":"0.47","size":"30"},{"price":"0.45","size":"40"}],"timestamp":"1000"},{"event_type":"book","asset_id":"no","bids":[{"price":"0.53","size":"50"}],"asks":[{"price":"0.57","size":"60"}],"timestamp":"1001"}]"#;
         let mut snapshot = BookSnapshot::default();
         assert!(parse_and_apply(payload, "yes", "no", &mut snapshot).unwrap());
         assert_eq!(
