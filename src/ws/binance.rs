@@ -24,6 +24,7 @@ struct BinanceTick {
 pub struct PriceTick {
     pub price: f64,
     pub trade_time_ms: u64,
+    pub received_at_ms: u64,
 }
 
 impl PriceTick {
@@ -31,6 +32,7 @@ impl PriceTick {
         Self {
             price,
             trade_time_ms,
+            received_at_ms: trade_time_ms,
         }
     }
 }
@@ -52,14 +54,16 @@ pub async fn run(tx: Sender<PriceTick>, health: Arc<HealthState>) -> Result<()> 
                     match message {
                         Ok(message) if message.is_text() => {
                             let raw = message.into_text()?;
-                            let tick = match parse_message(&raw) {
+                            let mut tick = match parse_message(&raw) {
                                 Ok(tick) => tick,
                                 Err(error) => {
                                     warn!(%error, "Invalid Binance aggTrade payload");
                                     continue;
                                 }
                             };
-                            health.mark_binance(now_ms());
+                            let received_at_ms = now_ms();
+                            tick.received_at_ms = received_at_ms;
+                            health.mark_binance(received_at_ms);
                             if tx.try_send(tick).is_err() {
                                 health.trip(2);
                                 anyhow::bail!(

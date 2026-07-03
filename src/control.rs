@@ -47,6 +47,10 @@ struct HealthResponse {
     status: &'static str,
     accepting_commands: bool,
     config_version: Option<String>,
+    state: &'static str,
+    market_ready: bool,
+    last_binance_ms: u64,
+    last_book_ms: u64,
 }
 
 struct HttpRequest {
@@ -113,16 +117,21 @@ async fn route(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
 
 fn health_response(context: &ControlContext) -> HttpResponse {
     let config_version = context.strategy_store.version().unwrap_or(None);
+    let health = context.health.snapshot();
     HttpResponse::json(
         "200 OK",
         &HealthResponse {
-            status: if context.health.is_faulted() {
+            status: if health.state == "faulted" {
                 "DOWN"
             } else {
                 "UP"
             },
             accepting_commands: context.health.accepting_commands(),
             config_version,
+            state: health.state,
+            market_ready: health.market_ready,
+            last_binance_ms: health.last_binance_ms,
+            last_book_ms: health.last_book_ms,
         },
     )
 }
@@ -330,6 +339,10 @@ mod tests {
         assert_eq!(initial.json["status"], "UP");
         assert_eq!(initial.json["acceptingCommands"], true);
         assert!(initial.json["configVersion"].is_null());
+        assert_eq!(initial.json["state"], "stopped");
+        assert_eq!(initial.json["marketReady"], true);
+        assert_eq!(initial.json["lastBinanceMs"], 0);
+        assert_eq!(initial.json["lastBookMs"], 0);
         assert_eq!(request(address, "GET", "/health", None).await.status, 404);
 
         let mut invalid_config = strategy_json("invalid");
@@ -557,6 +570,9 @@ mod tests {
             "holdMs":5000,
             "minExpectedPriceMove":0.05,
             "entrySlippage":0.02,
+            "entryConfirmationMs":1000,
+            "minEntryBidImprovement":0.01,
+            "minExchangeShares":5,
             "minProgress":0.05,
             "maxProgress":0.90,
             "maxSpread":0.02,

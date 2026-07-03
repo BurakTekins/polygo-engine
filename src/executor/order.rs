@@ -390,8 +390,7 @@ async fn execute_live(
         return;
     }
     let book = book_state.load();
-    let Some((ask, shares)) =
-        revalidate_entry(book, executed_at_ms, &market_clock, &config, signal.side)
+    let Some(_) = revalidate_entry(book, executed_at_ms, &market_clock, &config, signal.side)
     else {
         let revalidation_market = market_rx.borrow().clone();
         reject_with_context(
@@ -411,6 +410,87 @@ async fn execute_live(
         );
         return;
     };
+    let Some(initial_bid) = outcome_book(book, signal.side).bid else {
+        reject(
+            signal,
+            "entry_confirmation_missing_bid",
+            &engine_state,
+            &audit,
+        );
+        return;
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(
+        config.entry_confirmation_ms,
+    ))
+    .await;
+    let confirmed_at_ms = now_ms();
+    if !health.is_running() {
+        reject(signal, "engine_stopped", &engine_state, &audit);
+        return;
+    }
+    let Some(config) = strategy_store.load() else {
+        reject(signal, "config_missing", &engine_state, &audit);
+        return;
+    };
+    if config.generation != signal.config_generation {
+        reject(signal, "config_changed", &engine_state, &audit);
+        return;
+    }
+    let confirmed_book = book_state.load();
+    let Some((ask, shares)) = revalidate_entry(
+        confirmed_book,
+        confirmed_at_ms,
+        &market_clock,
+        &config,
+        signal.side,
+    ) else {
+        let revalidation_market = market_rx.borrow().clone();
+        reject_with_context(
+            signal,
+            "entry_confirmation_revalidation",
+            &engine_state,
+            &audit,
+            Some(audit_context(
+                confirmed_book,
+                confirmed_at_ms,
+                signal.side,
+                revalidation_market.as_ref(),
+                Some(config.entry_slippage),
+                None,
+                None,
+            )),
+        );
+        return;
+    };
+    let Some(confirmed_bid) = outcome_book(confirmed_book, signal.side).bid else {
+        reject(
+            signal,
+            "entry_confirmation_missing_bid",
+            &engine_state,
+            &audit,
+        );
+        return;
+    };
+    if confirmed_bid + 0.00001 < initial_bid + config.min_entry_bid_improvement {
+        let confirmation_market = market_rx.borrow().clone();
+        reject_with_context(
+            signal,
+            "entry_confirmation",
+            &engine_state,
+            &audit,
+            Some(audit_context(
+                confirmed_book,
+                confirmed_at_ms,
+                signal.side,
+                confirmation_market.as_ref(),
+                Some(config.entry_slippage),
+                None,
+                None,
+            )),
+        );
+        return;
+    }
     let Some(active_market) = market_rx.borrow().clone() else {
         reject(signal, "market_missing", &engine_state, &audit);
         return;
@@ -430,20 +510,30 @@ async fn execute_live(
 
     let entry_limit_price = (ask + config.entry_slippage).min(0.95);
     let mut entry_context = audit_context(
-        book,
-        executed_at_ms,
+        confirmed_book,
+        confirmed_at_ms,
         signal.side,
         Some(&active_market),
         Some(config.entry_slippage),
         Some(entry_limit_price),
         Some(shares),
     );
+    if shares < config.min_exchange_shares {
+        reject_with_context(
+            signal,
+            "entry_below_exchange_min_size",
+            &engine_state,
+            &audit,
+            Some(entry_context),
+        );
+        return;
+    }
     let depth = book_state.load_depth();
     let available_shares = executable_ask_shares(&depth, signal.side, entry_limit_price);
     let required_shares = shares as f64 * ENTRY_DEPTH_MULTIPLIER;
     entry_context.available_shares = Some(round_5(available_shares));
     entry_context.required_shares = Some(round_5(required_shares));
-    if executed_at_ms.saturating_sub(depth.received_at_ms) > config.max_book_age_ms
+    if confirmed_at_ms.saturating_sub(depth.received_at_ms) > config.max_book_age_ms
         || available_shares + 0.00001 < required_shares
     {
         reject_with_context(
@@ -487,8 +577,8 @@ async fn execute_live(
     let _ = audit.emit(AuditEvent::LiveEntry {
         position_id,
         signal_ts_ms: signal.signal_ts_ms,
-        executed_at_ms,
-        latency_ms: executed_at_ms.saturating_sub(signal.signal_ts_ms),
+        executed_at_ms: confirmed_at_ms,
+        latency_ms: confirmed_at_ms.saturating_sub(signal.signal_ts_ms),
         side: signal.side.as_str(),
         token_id: token_id_text.clone(),
         order_id: entry_order_id,

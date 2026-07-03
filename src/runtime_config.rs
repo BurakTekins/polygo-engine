@@ -17,6 +17,9 @@ pub struct JavaStrategyConfig {
     pub hold_ms: u64,
     pub min_expected_price_move: f64,
     pub entry_slippage: f64,
+    pub entry_confirmation_ms: u64,
+    pub min_entry_bid_improvement: f64,
+    pub min_exchange_shares: u64,
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
@@ -50,6 +53,13 @@ impl JavaStrategyConfig {
         }
         if !self.entry_slippage.is_finite() || !(0.0..=0.20).contains(&self.entry_slippage) {
             return Err("invalid_entry_slippage");
+        }
+        if self.entry_confirmation_ms == 0
+            || !self.min_entry_bid_improvement.is_finite()
+            || !(0.0..=0.20).contains(&self.min_entry_bid_improvement)
+            || self.min_exchange_shares == 0
+        {
+            return Err("invalid_entry_confirmation");
         }
         if !self.min_progress.is_finite()
             || !self.max_progress.is_finite()
@@ -88,6 +98,9 @@ pub struct StrategySnapshot {
     pub hold_ms: u64,
     pub min_expected_price_move: f64,
     pub entry_slippage: f64,
+    pub entry_confirmation_ms: u64,
+    pub min_entry_bid_improvement: f64,
+    pub min_exchange_shares: u64,
     pub min_progress: f64,
     pub max_progress: f64,
     pub max_spread: f64,
@@ -111,6 +124,9 @@ pub struct StrategyStore {
     hold_ms: AtomicU64,
     min_expected_price_move: AtomicU64,
     entry_slippage: AtomicU64,
+    entry_confirmation_ms: AtomicU64,
+    min_entry_bid_improvement: AtomicU64,
+    min_exchange_shares: AtomicU64,
     min_progress: AtomicU64,
     max_progress: AtomicU64,
     max_spread: AtomicU64,
@@ -140,6 +156,9 @@ impl StrategyStore {
             hold_ms: AtomicU64::new(defaults.hold_ms),
             min_expected_price_move: AtomicU64::new(defaults.min_expected_price_move.to_bits()),
             entry_slippage: AtomicU64::new(defaults.entry_slippage.to_bits()),
+            entry_confirmation_ms: AtomicU64::new(0),
+            min_entry_bid_improvement: AtomicU64::new(0.0f64.to_bits()),
+            min_exchange_shares: AtomicU64::new(1),
             min_progress: AtomicU64::new(defaults.min_market_progress.to_bits()),
             max_progress: AtomicU64::new(defaults.max_market_progress.to_bits()),
             max_spread: AtomicU64::new(risk.max_spread.to_bits()),
@@ -178,6 +197,12 @@ impl StrategyStore {
             .store(config.min_expected_price_move.to_bits(), Ordering::Relaxed);
         self.entry_slippage
             .store(config.entry_slippage.to_bits(), Ordering::Relaxed);
+        self.entry_confirmation_ms
+            .store(config.entry_confirmation_ms, Ordering::Relaxed);
+        self.min_entry_bid_improvement
+            .store(config.min_entry_bid_improvement.to_bits(), Ordering::Relaxed);
+        self.min_exchange_shares
+            .store(config.min_exchange_shares, Ordering::Relaxed);
         self.min_progress
             .store(config.min_progress.to_bits(), Ordering::Relaxed);
         self.max_progress
@@ -227,6 +252,11 @@ impl StrategyStore {
                     self.min_expected_price_move.load(Ordering::Relaxed),
                 ),
                 entry_slippage: f64::from_bits(self.entry_slippage.load(Ordering::Relaxed)),
+                entry_confirmation_ms: self.entry_confirmation_ms.load(Ordering::Relaxed),
+                min_entry_bid_improvement: f64::from_bits(
+                    self.min_entry_bid_improvement.load(Ordering::Relaxed),
+                ),
+                min_exchange_shares: self.min_exchange_shares.load(Ordering::Relaxed),
                 min_progress: f64::from_bits(self.min_progress.load(Ordering::Relaxed)),
                 max_progress: f64::from_bits(self.max_progress.load(Ordering::Relaxed)),
                 max_spread: f64::from_bits(self.max_spread.load(Ordering::Relaxed)),
@@ -293,6 +323,9 @@ mod tests {
         assert_eq!(store.update(&config), Ok(1));
         let snapshot = store.load().unwrap();
         assert_eq!(snapshot.momentum_window_ms, 100);
+        assert_eq!(snapshot.entry_confirmation_ms, 1_000);
+        assert_eq!(snapshot.min_entry_bid_improvement, 0.01);
+        assert_eq!(snapshot.min_exchange_shares, 5);
         assert_eq!(snapshot.max_shares, 500);
         assert!(store.version_matches("momentum-v1"));
     }
@@ -308,6 +341,9 @@ mod tests {
             hold_ms: 5_000,
             min_expected_price_move: 0.05,
             entry_slippage: 0.02,
+            entry_confirmation_ms: 1_000,
+            min_entry_bid_improvement: 0.01,
+            min_exchange_shares: 5,
             min_progress: 0.05,
             max_progress: 0.9,
             max_spread: 0.02,

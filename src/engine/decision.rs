@@ -25,6 +25,7 @@ pub async fn run(
     let mut strategy = None;
     let mut strategy_generation = 0;
     let mut last_signal_ts_ms = 0;
+    let mut last_diagnostic_log_ms = 0;
     info!("Decision engine started");
 
     while let Some(tick) = binance_rx.recv().await {
@@ -41,7 +42,7 @@ pub async fn run(
             last_signal_ts_ms = 0;
         }
         let received_at_ms = now_ms();
-        if received_at_ms.saturating_sub(tick.trade_time_ms) > config.max_book_age_ms {
+        if received_at_ms.saturating_sub(tick.received_at_ms) > config.max_book_age_ms {
             continue;
         }
         let candidate = strategy
@@ -51,19 +52,33 @@ pub async fn run(
             continue;
         };
         if candidate.signal_ts_ms.saturating_sub(last_signal_ts_ms) < config.hold_ms {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "cooldown", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, "Momentum candidate rejected");
+            }
             continue;
         }
-        if !health.is_running()
-            || !market_clock.progress_allowed(
-                received_at_ms,
-                config.min_progress,
-                config.max_progress,
-            )
-        {
+        if !health.is_running() {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "engine_stopped", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, "Momentum candidate rejected");
+            }
+            continue;
+        }
+        if !market_clock.progress_allowed(
+            received_at_ms,
+            config.min_progress,
+            config.max_progress,
+        ) {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "market_progress", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, "Momentum candidate rejected");
+            }
             continue;
         }
         let book = book_state.load();
-        if received_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
+        let book_age_ms = received_at_ms.saturating_sub(book.received_at_ms);
+        if book_age_ms > config.max_book_age_ms {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "stale_book", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, book_age_ms, "Momentum candidate rejected");
+            }
             continue;
         }
         let outcome = match candidate.side {
@@ -71,14 +86,34 @@ pub async fn run(
             OrderSide::BuyNo => book.no,
         };
         let (Some(bid), Some(ask)) = (outcome.bid, outcome.ask) else {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "missing_book", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, "Momentum candidate rejected");
+            }
             continue;
         };
-        if ask <= bid
-            || ask - bid > config.max_spread
-            || ask < config.min_price
-            || ask > config.max_price
-            || engine_state.try_reserve().is_err()
-        {
+        if ask <= bid {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "crossed_book", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, bid, ask, "Momentum candidate rejected");
+            }
+            continue;
+        }
+        let spread = ask - bid;
+        if spread > config.max_spread {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "spread", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, bid, ask, spread, max_spread = config.max_spread, "Momentum candidate rejected");
+            }
+            continue;
+        }
+        if ask < config.min_price || ask > config.max_price {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "price_range", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, ask, min_price = config.min_price, max_price = config.max_price, "Momentum candidate rejected");
+            }
+            continue;
+        }
+        if engine_state.try_reserve().is_err() {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(reason = "position_reserved", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, "Momentum candidate rejected");
+            }
             continue;
         }
 
@@ -97,7 +132,16 @@ pub async fn run(
             health.trip(3);
             anyhow::bail!("execution channel full or closed");
         }
+        info!(side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, bid, ask, "Momentum candidate accepted");
         last_signal_ts_ms = candidate.signal_ts_ms;
     }
     Ok(())
+}
+
+fn diagnostic_due(last_log_ms: &mut u64, now_ms: u64) -> bool {
+    if now_ms.saturating_sub(*last_log_ms) < 1_000 {
+        return false;
+    }
+    *last_log_ms = now_ms;
+    true
 }
