@@ -1009,7 +1009,7 @@ pub fn revalidate_entry(
     let (Some(bid), Some(ask)) = (outcome.bid, outcome.ask) else {
         return None;
     };
-    if ask <= bid || ask - bid > config.max_spread {
+    if ask <= bid || ask - bid > config.max_spread + 0.00001 {
         return None;
     }
     if ask < config.min_price || ask > config.max_price {

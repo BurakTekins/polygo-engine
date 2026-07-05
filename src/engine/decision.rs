@@ -98,7 +98,7 @@ pub async fn run(
             continue;
         }
         let spread = ask - bid;
-        if spread > config.max_spread {
+        if spread > config.max_spread + 0.00001 {
             if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
                 info!(reason = "spread", side = candidate.side.as_str(), momentum_usd = candidate.momentum_usd, bid, ask, spread, max_spread = config.max_spread, "Momentum candidate rejected");
             }
