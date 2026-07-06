@@ -7,24 +7,24 @@
     "discovery_poll_ms": 1000
   },
   "strategy": {
-    "momentum_window_ms": 100,
-    "momentum_threshold_usd": 8.0,
+    "momentum_window_ms": 250,
+    "momentum_threshold_usd": 10.0,
     "buy_yes_momentum_threshold_usd": 12.0,
-    "buy_no_momentum_threshold_usd": 8.0,
+    "buy_no_momentum_threshold_usd": 10.0,
     "execution_latency_ms": 0,
     "hold_ms": 5000,
     "min_expected_price_move": 0.05,
-    "entry_slippage": 0.02,
+    "entry_slippage": 0.01,
     "min_market_progress": 0.05,
     "max_market_progress": 0.90,
     "max_book_age_ms": 300
   },
   "risk": {
     "max_spread": 0.02,
-    "max_notional_usd": 1.0,
+    "max_notional_usd": 5.0,
     "max_shares": 20,
     "max_open_positions": 1,
-    "daily_loss_limit_usd": 5.0
+    "daily_loss_limit_usd": 10.0
   },
   "integration": {
     "java_audit_endpoint": "http://audit-service:8081/api/v1/audit-events/engine"
