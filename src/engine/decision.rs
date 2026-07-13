@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use crate::engine::state::EngineState;
-use crate::engine::strategy::{MomentumStrategy, Strategy};
+use crate::engine::strategy::{BtcPriceHistory, MomentumStrategy, Strategy};
 use crate::executor::order::{OrderSide, OrderSignal};
 use crate::health::HealthState;
 use crate::market::{now_ms, MarketClock};
@@ -16,6 +16,7 @@ use crate::ws::polymarket::BookState;
 pub async fn run(
     mut binance_rx: mpsc::Receiver<PriceTick>,
     book_state: Arc<BookState>,
+    btc_price_history: Arc<BtcPriceHistory>,
     order_tx: mpsc::Sender<OrderSignal>,
     engine_state: Arc<EngineState>,
     health: Arc<HealthState>,
@@ -45,6 +46,7 @@ pub async fn run(
         if received_at_ms.saturating_sub(tick.received_at_ms) > config.max_book_age_ms {
             continue;
         }
+        btc_price_history.record(tick);
         let candidate = strategy
             .as_mut()
             .and_then(|strategy| strategy.on_binance_tick(tick, received_at_ms));

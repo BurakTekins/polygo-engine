@@ -19,7 +19,8 @@ use tracing::{info, warn};
 
 use crate::config::ExecutionMode;
 use crate::emitter::audit::{AuditBookContext, AuditEmitter, AuditEvent};
-use crate::engine::state::{round_5, EngineState};
+use crate::engine::state::{round_5, taker_fee_decimal, EngineState};
+use crate::engine::strategy::BtcPriceHistory;
 use crate::health::HealthState;
 use crate::market::{now_ms, ActiveMarket, MarketClock};
 use crate::runtime_config::{StrategySnapshot, StrategyStore};
@@ -277,6 +278,7 @@ pub async fn run(
     mut order_rx: mpsc::Receiver<OrderSignal>,
     market_rx: watch::Receiver<Option<ActiveMarket>>,
     book_state: Arc<BookState>,
+    btc_price_history: Arc<BtcPriceHistory>,
     engine_state: Arc<EngineState>,
     health: Arc<HealthState>,
     market_clock: Arc<MarketClock>,
@@ -303,6 +305,7 @@ pub async fn run(
         let _ = audit.emit(AuditEvent::signal(signal, Some(signal_context)));
         let task_market_rx = market_rx.clone();
         let task_book_state = Arc::clone(&book_state);
+        let task_btc_price_history = Arc::clone(&btc_price_history);
         let task_state = Arc::clone(&engine_state);
         let task_health = Arc::clone(&health);
         let task_clock = Arc::clone(&market_clock);
@@ -315,6 +318,7 @@ pub async fn run(
                     execute_dry_run(
                         signal,
                         task_book_state,
+                        task_btc_price_history,
                         task_state,
                         task_health,
                         task_clock,
@@ -332,6 +336,7 @@ pub async fn run(
                         signal,
                         task_market_rx,
                         task_book_state,
+                        task_btc_price_history,
                         task_state,
                         task_health,
                         task_clock,
@@ -379,9 +384,119 @@ async fn warm_live_market_cache(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExitDecision {
+    reason: &'static str,
+    decided_at_ms: u64,
+    held_ms: u64,
+    exit_momentum_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExitMark {
+    net_pnl: f64,
+}
+
+async fn wait_for_exit_decision(
+    signal: &OrderSignal,
+    entry_at_ms: u64,
+    entry_price: f64,
+    shares: f64,
+    config: &StrategySnapshot,
+    book_state: &BookState,
+    btc_price_history: &BtcPriceHistory,
+) -> ExitDecision {
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(
+            config.exit_check_interval_ms,
+        ))
+        .await;
+        let decided_at_ms = now_ms();
+        let held_ms = decided_at_ms.saturating_sub(entry_at_ms);
+        let book = book_state.load();
+        let mark = exit_mark(
+            book,
+            decided_at_ms,
+            signal.side,
+            entry_price,
+            shares,
+            config,
+        );
+        let exit_momentum_usd = btc_price_history.recent_momentum(config.exit_reversal_window_ms);
+        let is_adverse = adverse_reversal(
+            signal.side,
+            exit_momentum_usd,
+            config.exit_reversal_threshold_usd,
+        );
+
+        if mark
+            .map(|mark| mark.net_pnl <= config.exit_stop_loss_net_usd)
+            .unwrap_or(false)
+        {
+            return ExitDecision {
+                reason: "stop_loss",
+                decided_at_ms,
+                held_ms,
+                exit_momentum_usd,
+            };
+        }
+        if let Some(mark) = mark.filter(|_| held_ms >= config.exit_min_hold_ms && is_adverse) {
+            return ExitDecision {
+                reason: if mark.net_pnl >= config.exit_take_profit_net_usd {
+                    "profit_reversal"
+                } else {
+                    "momentum_reversal"
+                },
+                decided_at_ms,
+                held_ms,
+                exit_momentum_usd,
+            };
+        }
+        if held_ms >= config.exit_max_hold_ms {
+            return ExitDecision {
+                reason: "max_hold",
+                decided_at_ms,
+                held_ms,
+                exit_momentum_usd,
+            };
+        }
+    }
+}
+
+fn exit_mark(
+    book: BookSnapshot,
+    now_ms: u64,
+    side: OrderSide,
+    entry_price: f64,
+    shares: f64,
+    config: &StrategySnapshot,
+) -> Option<ExitMark> {
+    if now_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
+        return None;
+    }
+    let exit_price = outcome_book(book, side).bid?;
+    let gross_pnl = (exit_price - entry_price) * shares;
+    let entry_fee = taker_fee_decimal(shares, entry_price);
+    let exit_fee = taker_fee_decimal(shares, exit_price);
+    Some(ExitMark {
+        net_pnl: round_5(gross_pnl - entry_fee - exit_fee),
+    })
+}
+
+fn adverse_reversal(side: OrderSide, momentum_usd: Option<f64>, threshold_usd: f64) -> bool {
+    let Some(momentum_usd) = momentum_usd else {
+        return false;
+    };
+    match side {
+        OrderSide::BuyYes => momentum_usd <= -threshold_usd,
+        OrderSide::BuyNo => momentum_usd >= threshold_usd,
+    }
+}
+
 async fn execute_dry_run(
     signal: OrderSignal,
     book_state: Arc<BookState>,
+    btc_price_history: Arc<BtcPriceHistory>,
     engine_state: Arc<EngineState>,
     health: Arc<HealthState>,
     market_clock: Arc<MarketClock>,
@@ -436,8 +551,17 @@ async fn execute_dry_run(
         notional_usd: round_5(ask * shares as f64),
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(signal.hold_ms)).await;
-    let exit_at_ms = now_ms();
+    let exit_decision = wait_for_exit_decision(
+        &signal,
+        executed_at_ms,
+        ask,
+        shares as f64,
+        &config,
+        &book_state,
+        &btc_price_history,
+    )
+    .await;
+    let exit_at_ms = exit_decision.decided_at_ms;
     let book = book_state.load();
     if exit_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
         engine_state.release_reservation();
@@ -460,13 +584,21 @@ async fn execute_dry_run(
         return;
     };
     let closed = engine_state.close(ask, exit_price, shares);
-    let _ = audit.emit(AuditEvent::exit(position_id, signal.side.as_str(), closed));
+    let _ = audit.emit(AuditEvent::exit(
+        position_id,
+        signal.side.as_str(),
+        closed,
+        exit_decision.reason,
+        exit_decision.held_ms,
+        exit_decision.exit_momentum_usd.map(round_5),
+    ));
 }
 
 async fn execute_live(
     signal: OrderSignal,
     market_rx: watch::Receiver<Option<ActiveMarket>>,
     book_state: Arc<BookState>,
+    btc_price_history: Arc<BtcPriceHistory>,
     engine_state: Arc<EngineState>,
     health: Arc<HealthState>,
     market_clock: Arc<MarketClock>,
@@ -703,8 +835,17 @@ async fn execute_live(
         context: Some(entry_context),
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(signal.hold_ms)).await;
-    let exit_at_ms = now_ms();
+    let exit_decision = wait_for_exit_decision(
+        &signal,
+        confirmed_at_ms,
+        entry_price,
+        filled_shares,
+        &config,
+        &book_state,
+        &btc_price_history,
+    )
+    .await;
+    let exit_at_ms = exit_decision.decided_at_ms;
     let book = book_state.load();
     let exit_context = audit_context(
         book,
@@ -861,6 +1002,9 @@ async fn execute_live(
         position_id,
         closed_at_ms: now_ms(),
         side: signal.side.as_str(),
+        exit_reason: exit_decision.reason,
+        held_ms: exit_decision.held_ms,
+        exit_momentum_usd: exit_decision.exit_momentum_usd.map(round_5),
         token_id: token_id_text,
         order_id: exit_order_id,
         order_status: exit_order_status,

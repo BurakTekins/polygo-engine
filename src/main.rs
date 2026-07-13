@@ -3,6 +3,7 @@ use std::sync::Arc;
 use polygo_engine::config::{EngineConfig, ExecutionMode};
 use polygo_engine::emitter::audit::AuditEmitter;
 use polygo_engine::engine::state::EngineState;
+use polygo_engine::engine::strategy::BtcPriceHistory;
 use polygo_engine::executor::order::{LiveExecutor, OrderSignal};
 use polygo_engine::health::HealthState;
 use polygo_engine::market::{ActiveMarket, MarketClock};
@@ -32,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let health = Arc::new(HealthState::new());
     let market_clock = Arc::new(MarketClock::default());
     let book_state = Arc::new(BookState::default());
+    let btc_price_history = Arc::new(BtcPriceHistory::new(5_000));
     let engine_state = Arc::new(EngineState::new(
         config.risk.max_open_positions,
         config.risk.daily_loss_limit_usd,
@@ -66,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let decision_handle = tokio::spawn(polygo_engine::engine::decision::run(
         binance_rx,
         Arc::clone(&book_state),
+        Arc::clone(&btc_price_history),
         order_tx,
         Arc::clone(&engine_state),
         Arc::clone(&health),
@@ -76,6 +79,7 @@ async fn main() -> anyhow::Result<()> {
         order_rx,
         market_rx,
         Arc::clone(&book_state),
+        Arc::clone(&btc_price_history),
         Arc::clone(&engine_state),
         Arc::clone(&health),
         Arc::clone(&market_clock),

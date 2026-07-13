@@ -115,6 +115,10 @@ pub enum AuditEvent {
         position_id: u64,
         closed_at_ms: u64,
         side: &'static str,
+        exit_reason: &'static str,
+        held_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_momentum_usd: Option<f64>,
         entry_price: f64,
         exit_price: f64,
         shares: u64,
@@ -142,6 +146,10 @@ pub enum AuditEvent {
         position_id: u64,
         closed_at_ms: u64,
         side: &'static str,
+        exit_reason: &'static str,
+        held_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_momentum_usd: Option<f64>,
         token_id: String,
         order_id: String,
         order_status: String,
@@ -173,11 +181,21 @@ impl AuditEvent {
         }
     }
 
-    pub fn exit(position_id: u64, side: &'static str, closed: ClosedPosition) -> Self {
+    pub fn exit(
+        position_id: u64,
+        side: &'static str,
+        closed: ClosedPosition,
+        exit_reason: &'static str,
+        held_ms: u64,
+        exit_momentum_usd: Option<f64>,
+    ) -> Self {
         Self::DryRunExit {
             position_id,
             closed_at_ms: now_ms(),
             side,
+            exit_reason,
+            held_ms,
+            exit_momentum_usd,
             entry_price: closed.entry_price,
             exit_price: closed.exit_price,
             shares: closed.shares,
