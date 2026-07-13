@@ -48,12 +48,41 @@ pub struct AuditBookContext {
     pub exit_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_order_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_submit_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_build_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_sign_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_post_latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_post_success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_post_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_post_making_amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_post_taking_amount: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_poll_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_poll_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_poll_size_matched: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_cancel_confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_final_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtc_final_size_matched: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct AuditEnvelope {
     pub schema_version: u8,
     pub source: &'static str,
+    pub session_id: String,
     pub execution_mode: &'static str,
     pub emitted_at_ms: u64,
     pub config_version: Option<String>,
@@ -183,11 +212,13 @@ impl AuditEmitter {
             drop(java_rx);
         }
         let dispatcher_health = Arc::clone(&health);
+        let session_id = engine_session_id();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
                 let envelope = AuditEnvelope {
                     schema_version: 1,
                     source: "polygo-engine",
+                    session_id: session_id.clone(),
                     execution_mode,
                     emitted_at_ms: now_ms(),
                     config_version: strategy_store.version().ok().flatten(),
@@ -222,6 +253,10 @@ impl AuditEmitter {
             }
         }
     }
+}
+
+fn engine_session_id() -> String {
+    format!("engine-{}-{}", now_ms(), std::process::id())
 }
 
 async fn local_worker(mut rx: mpsc::Receiver<Vec<u8>>, health: Arc<HealthState>) {

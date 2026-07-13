@@ -35,6 +35,7 @@ const LIVE_EXIT_GTC_FINAL_POLLS: u32 = 1_200;
 const LIVE_EXIT_GTC_POLL_MS: u64 = 250;
 const LIVE_EXIT_GTC_FLOOR_PRICE: f64 = 0.01;
 const LIVE_ENTRY_GTC_POLLS: u32 = 8;
+const LIVE_ENTRY_GTC_FAST_POLLS: u32 = 2;
 const LIVE_ENTRY_GTC_POLL_MS: u64 = 250;
 
 type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
@@ -111,17 +112,59 @@ impl LiveExecutor {
         token_id: U256,
         shares: u64,
         limit_price: f64,
-    ) -> Result<PostOrderResponse> {
-        self.client
+    ) -> Result<TimedPostOrderResponse> {
+        let build_started_ms = now_ms();
+        let order = self
+            .client
             .limit_order()
             .token_id(token_id)
             .side(ClobSide::Buy)
             .price(decimal_from_f64(limit_price)?)
             .size(Decimal::from(shares))
             .order_type(OrderType::GTC)
-            .build_sign_and_post(&self.signer)
+            .build()
             .await
-            .context("Polymarket GTC buy order failed")
+            .context("Polymarket GTC buy order build failed")?;
+        let build_latency_ms = now_ms().saturating_sub(build_started_ms);
+        let sign_started_ms = now_ms();
+        let signed = self
+            .client
+            .sign(&self.signer, order)
+            .await
+            .context("Polymarket GTC buy order sign failed")?;
+        let sign_latency_ms = now_ms().saturating_sub(sign_started_ms);
+        let post_started_ms = now_ms();
+        let response = self
+            .client
+            .post_order(signed)
+            .await
+            .context("Polymarket GTC buy order post failed")?;
+        let post_latency_ms = now_ms().saturating_sub(post_started_ms);
+        Ok(TimedPostOrderResponse {
+            response,
+            build_latency_ms,
+            sign_latency_ms,
+            post_latency_ms,
+        })
+    }
+
+    pub async fn warm_market_cache(&self, market: &ActiveMarket) -> Result<()> {
+        self.client
+            .version()
+            .await
+            .context("Polymarket version warm-up failed")?;
+        for token_id_text in [&market.yes_asset_id, &market.no_asset_id] {
+            let token_id = U256::from_str(token_id_text).context("invalid warm-up token id")?;
+            self.client
+                .tick_size(token_id)
+                .await
+                .context("Polymarket tick size warm-up failed")?;
+            self.client
+                .neg_risk(token_id)
+                .await
+                .context("Polymarket neg-risk warm-up failed")?;
+        }
+        Ok(())
     }
 
     async fn place_gtc_sell(
@@ -143,6 +186,13 @@ impl LiveExecutor {
     }
 }
 
+struct TimedPostOrderResponse {
+    response: PostOrderResponse,
+    build_latency_ms: u64,
+    sign_latency_ms: u64,
+    post_latency_ms: u64,
+}
+
 struct GtcExitResult {
     sold_shares: f64,
     sale_proceeds: f64,
@@ -159,6 +209,20 @@ struct GtcEntryResult {
     order_status: Option<String>,
     error: Option<String>,
     pending: bool,
+    submit_latency_ms: Option<u64>,
+    build_latency_ms: Option<u64>,
+    sign_latency_ms: Option<u64>,
+    post_latency_ms: Option<u64>,
+    post_success: Option<bool>,
+    post_status: Option<String>,
+    post_making_amount: Option<f64>,
+    post_taking_amount: Option<f64>,
+    poll_count: u32,
+    poll_status: Option<String>,
+    poll_size_matched: Option<f64>,
+    cancel_confirmed: Option<bool>,
+    final_status: Option<String>,
+    final_size_matched: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +286,9 @@ pub async fn run(
     audit: AuditEmitter,
 ) {
     info!(mode = execution_mode.as_str(), "Executor started");
+    if let Some(live_executor) = live_executor.clone() {
+        tokio::spawn(warm_live_market_cache(market_rx.clone(), live_executor));
+    }
     while let Some(signal) = order_rx.recv().await {
         let signal_market = market_rx.borrow().clone();
         let signal_context = audit_context(
@@ -278,6 +345,38 @@ pub async fn run(
         });
     }
     warn!("Execution channel closed");
+}
+
+async fn warm_live_market_cache(
+    mut market_rx: watch::Receiver<Option<ActiveMarket>>,
+    live_executor: LiveExecutor,
+) {
+    let mut last_slug = String::new();
+    loop {
+        if market_rx.changed().await.is_err() {
+            return;
+        }
+        let Some(market) = market_rx.borrow().clone() else {
+            continue;
+        };
+        if market.slug == last_slug {
+            continue;
+        }
+        let started_ms = now_ms();
+        match live_executor.warm_market_cache(&market).await {
+            Ok(()) => {
+                last_slug = market.slug.clone();
+                info!(
+                    market_slug = %market.slug,
+                    elapsed_ms = now_ms().saturating_sub(started_ms),
+                    "Polymarket live order cache warmed"
+                );
+            }
+            Err(error) => {
+                warn!(%error, market_slug = %market.slug, "Polymarket live order cache warm-up failed");
+            }
+        }
+    }
 }
 
 async fn execute_dry_run(
@@ -548,6 +647,21 @@ async fn execute_live(
     let entry = buy_with_gtc_limit(&live_executor, token_id, shares, entry_limit_price).await;
     entry_context.fallback_order_id = entry.order_id.clone();
     entry_context.exchange_error = entry.error.clone();
+    entry_context.filled_shares = Some(round_5(entry.filled_shares));
+    entry_context.entry_submit_latency_ms = entry.submit_latency_ms;
+    entry_context.entry_build_latency_ms = entry.build_latency_ms;
+    entry_context.entry_sign_latency_ms = entry.sign_latency_ms;
+    entry_context.entry_post_latency_ms = entry.post_latency_ms;
+    entry_context.gtc_post_success = entry.post_success;
+    entry_context.gtc_post_status = entry.post_status.clone();
+    entry_context.gtc_post_making_amount = entry.post_making_amount.map(round_5);
+    entry_context.gtc_post_taking_amount = entry.post_taking_amount.map(round_5);
+    entry_context.gtc_poll_count = Some(entry.poll_count);
+    entry_context.gtc_poll_status = entry.poll_status.clone();
+    entry_context.gtc_poll_size_matched = entry.poll_size_matched.map(round_5);
+    entry_context.gtc_cancel_confirmed = entry.cancel_confirmed;
+    entry_context.gtc_final_status = entry.final_status.clone();
+    entry_context.gtc_final_size_matched = entry.final_size_matched.map(round_5);
     if entry.filled_shares <= 0.0 {
         warn!(side = signal.side.as_str(), shares, entry_limit_price, error = ?entry.error, pending = entry.pending, "Live GTC entry produced zero fill");
         reject_with_context(
@@ -659,7 +773,10 @@ async fn execute_live(
                 }
             }
             Ok(response) => {
-                let error = response.error_msg.clone().unwrap_or_else(|| response.status.to_string());
+                let error = response
+                    .error_msg
+                    .clone()
+                    .unwrap_or_else(|| response.status.to_string());
                 if !is_no_match_error(&error) {
                     last_error = Some(error);
                     break;
@@ -723,13 +840,11 @@ async fn execute_live(
         return;
     }
 
-    let exit_order = fallback_order_id
-        .zip(fallback_order_status)
-        .or_else(|| {
-            last_response.as_ref().map(|response| {
-                (response.order_id.clone(), response.status.to_string())
-            })
-        });
+    let exit_order = fallback_order_id.zip(fallback_order_status).or_else(|| {
+        last_response
+            .as_ref()
+            .map(|response| (response.order_id.clone(), response.status.to_string()))
+    });
     let Some((exit_order_id, exit_order_status)) = exit_order else {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
@@ -772,33 +887,84 @@ async fn buy_with_gtc_limit(
         order_status: None,
         error: None,
         pending: false,
+        submit_latency_ms: None,
+        build_latency_ms: None,
+        sign_latency_ms: None,
+        post_latency_ms: None,
+        post_success: None,
+        post_status: None,
+        post_making_amount: None,
+        post_taking_amount: None,
+        poll_count: 0,
+        poll_status: None,
+        poll_size_matched: None,
+        cancel_confirmed: None,
+        final_status: None,
+        final_size_matched: None,
     };
-    let response = match live_executor
+    let submit_started_ms = now_ms();
+    let timed_response = match live_executor
         .place_gtc_buy(token_id, shares, limit_price)
         .await
     {
-        Ok(response) if response.success => response,
-        Ok(response) => {
+        Ok(timed_response) if timed_response.response.success => timed_response,
+        Ok(timed_response) => {
+            let response = timed_response.response;
             let status = response.status.to_string();
+            result.submit_latency_ms = Some(now_ms().saturating_sub(submit_started_ms));
+            result.build_latency_ms = Some(timed_response.build_latency_ms);
+            result.sign_latency_ms = Some(timed_response.sign_latency_ms);
+            result.post_latency_ms = Some(timed_response.post_latency_ms);
+            result.order_id = Some(response.order_id.clone());
+            result.order_status = Some(status.clone());
+            result.post_success = Some(response.success);
+            result.post_status = Some(status.clone());
+            result.post_making_amount = decimal_to_f64(response.making_amount);
+            result.post_taking_amount = decimal_to_f64(response.taking_amount);
             result.error = response.error_msg.or(Some(status));
             return result;
         }
         Err(error) => {
+            result.submit_latency_ms = Some(now_ms().saturating_sub(submit_started_ms));
             result.error = Some(format!("{error:#}"));
             return result;
         }
     };
+    let response = timed_response.response;
+    result.submit_latency_ms = Some(now_ms().saturating_sub(submit_started_ms));
+    result.build_latency_ms = Some(timed_response.build_latency_ms);
+    result.sign_latency_ms = Some(timed_response.sign_latency_ms);
+    result.post_latency_ms = Some(timed_response.post_latency_ms);
 
     let order_id = response.order_id.clone();
     result.order_id = Some(order_id.clone());
     result.order_status = Some(response.status.to_string());
+    result.post_success = Some(response.success);
+    result.post_status = Some(response.status.to_string());
+    result.post_making_amount = decimal_to_f64(response.making_amount);
+    result.post_taking_amount = decimal_to_f64(response.taking_amount);
 
     let target_shares = shares as f64;
-    for _ in 0..LIVE_ENTRY_GTC_POLLS {
-        tokio::time::sleep(tokio::time::Duration::from_millis(
-            LIVE_ENTRY_GTC_POLL_MS,
-        ))
-        .await;
+    if let Some(filled) = buy_shares_filled(&response).filter(|filled| *filled > 0.0) {
+        result.filled_shares = filled.min(target_shares);
+        result.notional_usd = buy_notional_spent(&response)
+            .filter(|notional| *notional > 0.0)
+            .unwrap_or(result.filled_shares * limit_price);
+        if result.filled_shares + 0.00001 >= target_shares {
+            return result;
+        }
+    }
+    let max_polls = if result.post_status.as_deref() == Some("LIVE")
+        && result.post_making_amount.unwrap_or(0.0) <= 0.0
+        && result.post_taking_amount.unwrap_or(0.0) <= 0.0
+    {
+        LIVE_ENTRY_GTC_FAST_POLLS
+    } else {
+        LIVE_ENTRY_GTC_POLLS
+    };
+    for _ in 0..max_polls {
+        result.poll_count += 1;
+        tokio::time::sleep(tokio::time::Duration::from_millis(LIVE_ENTRY_GTC_POLL_MS)).await;
         let order = match live_executor.client.order(&order_id).await {
             Ok(order) => order,
             Err(error) => {
@@ -810,10 +976,14 @@ async fn buy_with_gtc_limit(
         let matched = decimal_to_f64(order.size_matched)
             .unwrap_or(0.0)
             .min(target_shares);
-        result.filled_shares = matched;
-        result.notional_usd = matched * limit_price;
+        result.poll_status = Some(order.status.to_string());
+        result.poll_size_matched = Some(matched);
+        if matched > result.filled_shares {
+            result.filled_shares = matched;
+            result.notional_usd = matched * limit_price;
+        }
         result.order_status = Some(order.status.to_string());
-        if matched + 0.00001 >= target_shares {
+        if result.filled_shares + 0.00001 >= target_shares {
             return result;
         }
     }
@@ -830,6 +1000,7 @@ async fn buy_with_gtc_limit(
         .canceled
         .iter()
         .any(|canceled_id| canceled_id == &order_id);
+    result.cancel_confirmed = Some(cancellation_confirmed);
     let final_order = match live_executor.client.order(&order_id).await {
         Ok(order) => order,
         Err(error) => {
@@ -843,10 +1014,14 @@ async fn buy_with_gtc_limit(
     let matched = decimal_to_f64(final_order.size_matched)
         .unwrap_or(0.0)
         .min(target_shares);
-    result.filled_shares = matched;
-    result.notional_usd = matched * limit_price;
+    result.final_status = Some(final_order.status.to_string());
+    result.final_size_matched = Some(matched);
+    if matched > result.filled_shares {
+        result.filled_shares = matched;
+        result.notional_usd = matched * limit_price;
+    }
     result.order_status = Some(final_order.status.to_string());
-    if !cancellation_confirmed && matched + 0.00001 < target_shares {
+    if !cancellation_confirmed && result.filled_shares + 0.00001 < target_shares {
         result.error = Some("GTC entry cancellation was not confirmed".to_owned());
         result.pending = true;
     }
@@ -905,8 +1080,7 @@ async fn sell_with_gtc_fallback(
             .unwrap_or(0.0)
             .min(remaining_shares);
         result.sold_shares += observed_order_fill;
-        result.sale_proceeds += observed_order_fill
-            * sell_price(&response).unwrap_or(limit_price);
+        result.sale_proceeds += observed_order_fill * sell_price(&response).unwrap_or(limit_price);
         result.order_id = Some(order_id.clone());
         result.order_status = Some(response.status.to_string());
         if result.sold_shares + 0.00001 >= target_shares {
@@ -919,10 +1093,7 @@ async fn sell_with_gtc_fallback(
             LIVE_EXIT_GTC_POLLS_PER_PRICE
         };
         for _ in 0..poll_attempts {
-            tokio::time::sleep(tokio::time::Duration::from_millis(
-                LIVE_EXIT_GTC_POLL_MS,
-            ))
-            .await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(LIVE_EXIT_GTC_POLL_MS)).await;
             let order = match live_executor.client.order(&order_id).await {
                 Ok(order) => order,
                 Err(error) => {
@@ -1093,6 +1264,20 @@ fn audit_context(
         filled_shares: None,
         exit_attempts: None,
         fallback_order_id: None,
+        entry_submit_latency_ms: None,
+        entry_build_latency_ms: None,
+        entry_sign_latency_ms: None,
+        entry_post_latency_ms: None,
+        gtc_post_success: None,
+        gtc_post_status: None,
+        gtc_post_making_amount: None,
+        gtc_post_taking_amount: None,
+        gtc_poll_count: None,
+        gtc_poll_status: None,
+        gtc_poll_size_matched: None,
+        gtc_cancel_confirmed: None,
+        gtc_final_status: None,
+        gtc_final_size_matched: None,
     }
 }
 
@@ -1147,6 +1332,14 @@ fn sell_price(response: &PostOrderResponse) -> Option<f64> {
 }
 
 fn sell_shares_filled(response: &PostOrderResponse) -> Option<f64> {
+    decimal_to_f64(response.making_amount)
+}
+
+fn buy_shares_filled(response: &PostOrderResponse) -> Option<f64> {
+    decimal_to_f64(response.taking_amount)
+}
+
+fn buy_notional_spent(response: &PostOrderResponse) -> Option<f64> {
     decimal_to_f64(response.making_amount)
 }
 

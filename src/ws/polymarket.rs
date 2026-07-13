@@ -108,7 +108,10 @@ impl BookState {
     }
 
     pub fn store_depth(&self, snapshot: &DepthSnapshot) {
-        *self.depth.write().unwrap_or_else(|error| error.into_inner()) = snapshot.clone();
+        *self
+            .depth
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = snapshot.clone();
     }
 
     pub fn load_depth(&self) -> DepthSnapshot {

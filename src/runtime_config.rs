@@ -199,8 +199,10 @@ impl StrategyStore {
             .store(config.entry_slippage.to_bits(), Ordering::Relaxed);
         self.entry_confirmation_ms
             .store(config.entry_confirmation_ms, Ordering::Relaxed);
-        self.min_entry_bid_improvement
-            .store(config.min_entry_bid_improvement.to_bits(), Ordering::Relaxed);
+        self.min_entry_bid_improvement.store(
+            config.min_entry_bid_improvement.to_bits(),
+            Ordering::Relaxed,
+        );
         self.min_exchange_shares
             .store(config.min_exchange_shares, Ordering::Relaxed);
         self.min_progress
