@@ -12,6 +12,15 @@ use crate::market::now_ms;
 use crate::runtime_config::StrategyStore;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AuditExitRetryAttempt {
+    pub attempt: u32,
+    pub error_class: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AuditBookContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market_slug: Option<String>,
@@ -46,6 +55,14 @@ pub struct AuditBookContext {
     pub filled_shares: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_retry_attempts: Option<Vec<AuditExitRetryAttempt>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_attempt_funder_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_matched_funder_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_order_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +177,8 @@ pub enum AuditEvent {
         entry_fee: f64,
         exit_fee: f64,
         net_pnl: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<AuditBookContext>,
     },
     ExecutionRejected {
         signal_ts_ms: u64,

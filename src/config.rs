@@ -51,7 +51,7 @@ pub struct StrategyConfig {
     pub exit_reversal_window_ms: u64,
     pub exit_reversal_threshold_usd: f64,
     pub exit_take_profit_net_usd: f64,
-    pub exit_stop_loss_net_usd: f64,
+    pub exit_stop_loss_pct: f64,
     pub min_expected_price_move: f64,
     pub entry_slippage: f64,
     pub min_market_progress: f64,
@@ -112,8 +112,9 @@ impl EngineConfig {
             || !strategy.exit_reversal_threshold_usd.is_finite()
             || strategy.exit_reversal_threshold_usd <= 0.0
             || !strategy.exit_take_profit_net_usd.is_finite()
-            || !strategy.exit_stop_loss_net_usd.is_finite()
-            || strategy.exit_stop_loss_net_usd >= 0.0
+            || !strategy.exit_stop_loss_pct.is_finite()
+            || strategy.exit_stop_loss_pct >= 0.0
+            || strategy.exit_stop_loss_pct < -100.0
             || !strategy.min_expected_price_move.is_finite()
             || strategy.min_expected_price_move < 0.0
             || !strategy.entry_slippage.is_finite()

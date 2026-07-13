@@ -174,7 +174,7 @@ fn java_config() -> JavaStrategyConfig {
         exit_reversal_window_ms: 100,
         exit_reversal_threshold_usd: 2.0,
         exit_take_profit_net_usd: 0.0,
-        exit_stop_loss_net_usd: -0.75,
+        exit_stop_loss_pct: -15.0,
         min_expected_price_move: 0.05,
         entry_slippage: 0.02,
         entry_confirmation_ms: 1_000,

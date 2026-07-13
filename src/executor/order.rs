@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::ExecutionMode;
-use crate::emitter::audit::{AuditBookContext, AuditEmitter, AuditEvent};
+use crate::emitter::audit::{AuditBookContext, AuditEmitter, AuditEvent, AuditExitRetryAttempt};
 use crate::engine::state::{round_5, taker_fee_decimal, EngineState};
 use crate::engine::strategy::BtcPriceHistory;
 use crate::health::HealthState;
@@ -38,6 +38,7 @@ const LIVE_EXIT_GTC_FLOOR_PRICE: f64 = 0.01;
 const LIVE_ENTRY_GTC_POLLS: u32 = 8;
 const LIVE_ENTRY_GTC_FAST_POLLS: u32 = 2;
 const LIVE_ENTRY_GTC_POLL_MS: u64 = 250;
+const LIVE_EXIT_BALANCE_RETRY_DELAYS_MS: [u64; 4] = [250, 500, 1_000, 2_000];
 
 type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
 
@@ -45,6 +46,8 @@ type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
 pub struct LiveExecutor {
     client: AuthenticatedClobClient,
     signer: PrivateKeySigner,
+    funder_address: Option<String>,
+    signature_type: String,
 }
 
 impl LiveExecutor {
@@ -83,16 +86,23 @@ impl LiveExecutor {
             env_nonempty("POLYMARKET_SIGNATURE_TYPE").as_deref(),
             funder.is_some(),
         )?;
+        let funder_address = funder.clone();
         if let Some(funder) = funder {
             builder = builder.funder(Address::from_str(&funder).context("invalid funder address")?);
         }
+        let signature_type_label = format!("{signature_type:?}");
         builder = builder.signature_type(signature_type);
 
         let client = builder
             .authenticate()
             .await
             .context("Polymarket authentication failed")?;
-        Ok(Self { client, signer })
+        Ok(Self {
+            client,
+            signer,
+            funder_address,
+            signature_type: signature_type_label,
+        })
     }
 
     async fn sell_shares(&self, token_id: U256, shares: f64) -> Result<PostOrderResponse> {
@@ -395,6 +405,7 @@ struct ExitDecision {
 #[derive(Debug, Clone, Copy)]
 struct ExitMark {
     net_pnl: f64,
+    net_pnl_pct: f64,
 }
 
 async fn wait_for_exit_decision(
@@ -430,7 +441,7 @@ async fn wait_for_exit_decision(
         );
 
         if mark
-            .map(|mark| mark.net_pnl <= config.exit_stop_loss_net_usd)
+            .map(|mark| mark.net_pnl_pct <= config.exit_stop_loss_pct)
             .unwrap_or(false)
         {
             return ExitDecision {
@@ -478,8 +489,14 @@ fn exit_mark(
     let gross_pnl = (exit_price - entry_price) * shares;
     let entry_fee = taker_fee_decimal(shares, entry_price);
     let exit_fee = taker_fee_decimal(shares, exit_price);
+    let entry_notional = entry_price * shares;
+    if entry_notional <= 0.0 {
+        return None;
+    }
+    let net_pnl = round_5(gross_pnl - entry_fee - exit_fee);
     Some(ExitMark {
-        net_pnl: round_5(gross_pnl - entry_fee - exit_fee),
+        net_pnl,
+        net_pnl_pct: round_5((net_pnl / entry_notional) * 100.0),
     })
 }
 
@@ -794,6 +811,8 @@ async fn execute_live(
     entry_context.gtc_cancel_confirmed = entry.cancel_confirmed;
     entry_context.gtc_final_status = entry.final_status.clone();
     entry_context.gtc_final_size_matched = entry.final_size_matched.map(round_5);
+    entry_context.entry_matched_funder_address = live_executor.funder_address.clone();
+    entry_context.signature_type = Some(live_executor.signature_type.clone());
     if entry.filled_shares <= 0.0 {
         warn!(side = signal.side.as_str(), shares, entry_limit_price, error = ?entry.error, pending = entry.pending, "Live GTC entry produced zero fill");
         reject_with_context(
@@ -847,7 +866,7 @@ async fn execute_live(
     .await;
     let exit_at_ms = exit_decision.decided_at_ms;
     let book = book_state.load();
-    let exit_context = audit_context(
+    let mut exit_context = audit_context(
         book,
         exit_at_ms,
         signal.side,
@@ -856,6 +875,9 @@ async fn execute_live(
         None,
         None,
     );
+    exit_context.entry_matched_funder_address = live_executor.funder_address.clone();
+    exit_context.exit_attempt_funder_address = live_executor.funder_address.clone();
+    exit_context.signature_type = Some(live_executor.signature_type.clone());
     if exit_at_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
@@ -894,6 +916,8 @@ async fn execute_live(
     let mut last_response = None;
     let mut last_error = None;
     let mut attempts = 0;
+    let mut exit_retry_attempts = Vec::new();
+    let mut balance_retry_exhausted = false;
 
     while attempts < LIVE_EXIT_MAX_ATTEMPTS {
         let remaining_shares = floor_to_2_decimals(sellable_shares - sold_shares);
@@ -918,6 +942,30 @@ async fn execute_live(
                     .error_msg
                     .clone()
                     .unwrap_or_else(|| response.status.to_string());
+                if is_balance_not_settled_error(&error) {
+                    last_error = Some(error.clone());
+                    if let Some(delay_ms) = LIVE_EXIT_BALANCE_RETRY_DELAYS_MS
+                        .get(exit_retry_attempts.len())
+                        .copied()
+                    {
+                        exit_retry_attempts.push(AuditExitRetryAttempt {
+                            attempt: attempts,
+                            error_class: "balance_not_settled",
+                            error: Some(error),
+                            delay_ms,
+                        });
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    balance_retry_exhausted = true;
+                    exit_retry_attempts.push(AuditExitRetryAttempt {
+                        attempt: attempts,
+                        error_class: "balance_not_settled_exhausted",
+                        error: Some(error),
+                        delay_ms: 0,
+                    });
+                    break;
+                }
                 if !is_no_match_error(&error) {
                     last_error = Some(error);
                     break;
@@ -926,6 +974,30 @@ async fn execute_live(
             }
             Err(error) => {
                 let error_chain = format!("{error:#}");
+                if is_balance_not_settled_error(&error_chain) {
+                    last_error = Some(error_chain.clone());
+                    if let Some(delay_ms) = LIVE_EXIT_BALANCE_RETRY_DELAYS_MS
+                        .get(exit_retry_attempts.len())
+                        .copied()
+                    {
+                        exit_retry_attempts.push(AuditExitRetryAttempt {
+                            attempt: attempts,
+                            error_class: "balance_not_settled",
+                            error: Some(error_chain),
+                            delay_ms,
+                        });
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    balance_retry_exhausted = true;
+                    exit_retry_attempts.push(AuditExitRetryAttempt {
+                        attempt: attempts,
+                        error_class: "balance_not_settled_exhausted",
+                        error: Some(error_chain),
+                        delay_ms: 0,
+                    });
+                    break;
+                }
                 if !is_no_match_error(&error_chain) {
                     last_error = Some(error_chain);
                     break;
@@ -941,7 +1013,7 @@ async fn execute_live(
     let mut fallback_order_id = None;
     let mut fallback_order_status = None;
     let mut fallback_pending = false;
-    if sold_shares + 0.00001 < sellable_shares {
+    if !balance_retry_exhausted && sold_shares + 0.00001 < sellable_shares {
         let fallback = sell_with_gtc_fallback(
             &live_executor,
             token_id,
@@ -967,11 +1039,16 @@ async fn execute_live(
         rejected_context.exchange_error = last_error;
         rejected_context.filled_shares = Some(round_5(sold_shares));
         rejected_context.exit_attempts = Some(attempts);
+        if !exit_retry_attempts.is_empty() {
+            rejected_context.exit_retry_attempts = Some(exit_retry_attempts);
+        }
         rejected_context.fallback_order_id = fallback_order_id;
         let _ = audit.emit(AuditEvent::ExecutionRejected {
             signal_ts_ms: signal.signal_ts_ms,
             side: signal.side.as_str(),
-            reason: if fallback_pending {
+            reason: if balance_retry_exhausted {
+                "manual_exit_required_balance_unavailable"
+            } else if fallback_pending {
                 "live_exit_gtc_pending_position_open"
             } else {
                 "live_exit_gtc_failed_position_open"
@@ -981,11 +1058,14 @@ async fn execute_live(
         return;
     }
 
-    let exit_order = fallback_order_id.zip(fallback_order_status).or_else(|| {
-        last_response
-            .as_ref()
-            .map(|response| (response.order_id.clone(), response.status.to_string()))
-    });
+    let exit_order = fallback_order_id
+        .clone()
+        .zip(fallback_order_status)
+        .or_else(|| {
+            last_response
+                .as_ref()
+                .map(|response| (response.order_id.clone(), response.status.to_string()))
+        });
     let Some((exit_order_id, exit_order_status)) = exit_order else {
         health.trip(5);
         let _ = audit.emit(AuditEvent::ExecutionRejected {
@@ -997,6 +1077,12 @@ async fn execute_live(
         return;
     };
     let exit_price = sale_proceeds / sold_shares;
+    exit_context.filled_shares = Some(round_5(sold_shares));
+    exit_context.exit_attempts = Some(attempts);
+    if !exit_retry_attempts.is_empty() {
+        exit_context.exit_retry_attempts = Some(exit_retry_attempts);
+    }
+    exit_context.fallback_order_id = fallback_order_id.clone();
     let closed = engine_state.close_live(entry_price, exit_price, sold_shares);
     let _ = audit.emit(AuditEvent::LiveExit {
         position_id,
@@ -1015,6 +1101,7 @@ async fn execute_live(
         entry_fee: closed.entry_fee,
         exit_fee: closed.exit_fee,
         net_pnl: closed.net_pnl,
+        context: Some(exit_context),
     });
 }
 
@@ -1407,6 +1494,10 @@ fn audit_context(
         exchange_error: None,
         filled_shares: None,
         exit_attempts: None,
+        exit_retry_attempts: None,
+        exit_attempt_funder_address: None,
+        entry_matched_funder_address: None,
+        signature_type: None,
         fallback_order_id: None,
         entry_submit_latency_ms: None,
         entry_build_latency_ms: None,
@@ -1438,6 +1529,13 @@ fn executable_ask_shares(depth: &DepthSnapshot, side: OrderSide, limit_price: f6
 
 fn is_no_match_error(error: &str) -> bool {
     error.contains("no orders found to match with FAK order")
+}
+
+fn is_balance_not_settled_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("not enough balance / allowance")
+        || (error.contains("balance: 0") && error.contains("order amount"))
+        || (error.contains("balance is not enough") && error.contains("allowance"))
 }
 
 fn outcome_book(snapshot: BookSnapshot, side: OrderSide) -> OutcomeBook {

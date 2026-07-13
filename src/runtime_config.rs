@@ -21,7 +21,7 @@ pub struct JavaStrategyConfig {
     pub exit_reversal_window_ms: u64,
     pub exit_reversal_threshold_usd: f64,
     pub exit_take_profit_net_usd: f64,
-    pub exit_stop_loss_net_usd: f64,
+    pub exit_stop_loss_pct: f64,
     pub min_expected_price_move: f64,
     pub entry_slippage: f64,
     pub entry_confirmation_ms: u64,
@@ -52,8 +52,9 @@ impl JavaStrategyConfig {
             || self.exit_min_hold_ms > self.exit_max_hold_ms
             || !positive_finite(self.exit_reversal_threshold_usd)
             || !self.exit_take_profit_net_usd.is_finite()
-            || !self.exit_stop_loss_net_usd.is_finite()
-            || self.exit_stop_loss_net_usd >= 0.0
+            || !self.exit_stop_loss_pct.is_finite()
+            || self.exit_stop_loss_pct >= 0.0
+            || self.exit_stop_loss_pct < -100.0
             || !positive_finite(self.momentum_threshold_usd)
             || !positive_finite(self.buy_yes_momentum_threshold_usd)
             || !positive_finite(self.buy_no_momentum_threshold_usd)
@@ -117,7 +118,7 @@ pub struct StrategySnapshot {
     pub exit_reversal_window_ms: u64,
     pub exit_reversal_threshold_usd: f64,
     pub exit_take_profit_net_usd: f64,
-    pub exit_stop_loss_net_usd: f64,
+    pub exit_stop_loss_pct: f64,
     pub min_expected_price_move: f64,
     pub entry_slippage: f64,
     pub entry_confirmation_ms: u64,
@@ -150,7 +151,7 @@ pub struct StrategyStore {
     exit_reversal_window_ms: AtomicU64,
     exit_reversal_threshold_usd: AtomicU64,
     exit_take_profit_net_usd: AtomicU64,
-    exit_stop_loss_net_usd: AtomicU64,
+    exit_stop_loss_pct: AtomicU64,
     min_expected_price_move: AtomicU64,
     entry_slippage: AtomicU64,
     entry_confirmation_ms: AtomicU64,
@@ -191,7 +192,7 @@ impl StrategyStore {
                 defaults.exit_reversal_threshold_usd.to_bits(),
             ),
             exit_take_profit_net_usd: AtomicU64::new(defaults.exit_take_profit_net_usd.to_bits()),
-            exit_stop_loss_net_usd: AtomicU64::new(defaults.exit_stop_loss_net_usd.to_bits()),
+            exit_stop_loss_pct: AtomicU64::new(defaults.exit_stop_loss_pct.to_bits()),
             min_expected_price_move: AtomicU64::new(defaults.min_expected_price_move.to_bits()),
             entry_slippage: AtomicU64::new(defaults.entry_slippage.to_bits()),
             entry_confirmation_ms: AtomicU64::new(0),
@@ -245,8 +246,8 @@ impl StrategyStore {
         );
         self.exit_take_profit_net_usd
             .store(config.exit_take_profit_net_usd.to_bits(), Ordering::Relaxed);
-        self.exit_stop_loss_net_usd
-            .store(config.exit_stop_loss_net_usd.to_bits(), Ordering::Relaxed);
+        self.exit_stop_loss_pct
+            .store(config.exit_stop_loss_pct.to_bits(), Ordering::Relaxed);
         self.min_expected_price_move
             .store(config.min_expected_price_move.to_bits(), Ordering::Relaxed);
         self.entry_slippage
@@ -314,9 +315,7 @@ impl StrategyStore {
                 exit_take_profit_net_usd: f64::from_bits(
                     self.exit_take_profit_net_usd.load(Ordering::Relaxed),
                 ),
-                exit_stop_loss_net_usd: f64::from_bits(
-                    self.exit_stop_loss_net_usd.load(Ordering::Relaxed),
-                ),
+                exit_stop_loss_pct: f64::from_bits(self.exit_stop_loss_pct.load(Ordering::Relaxed)),
                 min_expected_price_move: f64::from_bits(
                     self.min_expected_price_move.load(Ordering::Relaxed),
                 ),
@@ -379,7 +378,7 @@ mod tests {
             exit_reversal_window_ms: 100,
             exit_reversal_threshold_usd: 2.0,
             exit_take_profit_net_usd: 0.0,
-            exit_stop_loss_net_usd: -0.75,
+            exit_stop_loss_pct: -15.0,
             min_expected_price_move: 0.05,
             entry_slippage: 0.02,
             min_market_progress: 0.05,
@@ -406,7 +405,7 @@ mod tests {
         assert_eq!(snapshot.exit_max_hold_ms, 15_000);
         assert_eq!(snapshot.exit_min_hold_ms, 2_000);
         assert_eq!(snapshot.exit_reversal_threshold_usd, 2.0);
-        assert_eq!(snapshot.exit_stop_loss_net_usd, -0.75);
+        assert_eq!(snapshot.exit_stop_loss_pct, -15.0);
         assert!(store.version_matches("momentum-v1"));
     }
 
@@ -425,7 +424,7 @@ mod tests {
             exit_reversal_window_ms: 100,
             exit_reversal_threshold_usd: 2.0,
             exit_take_profit_net_usd: 0.0,
-            exit_stop_loss_net_usd: -0.75,
+            exit_stop_loss_pct: -15.0,
             min_expected_price_move: 0.05,
             entry_slippage: 0.02,
             entry_confirmation_ms: 1_000,
