@@ -10,6 +10,7 @@ use crate::executor::order::OrderSignal;
 use crate::health::HealthState;
 use crate::market::now_ms;
 use crate::runtime_config::StrategyStore;
+use crate::shadow::ShadowExitRecord;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditBookContext {
@@ -152,6 +153,9 @@ pub enum AuditEvent {
         entry_fee: f64,
         exit_fee: f64,
         net_pnl: f64,
+    },
+    ShadowExitResult {
+        record: Box<ShadowExitRecord>,
     },
     ExecutionRejected {
         signal_ts_ms: u64,

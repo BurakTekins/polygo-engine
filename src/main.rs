@@ -7,6 +7,7 @@ use polygo_engine::executor::order::{LiveExecutor, OrderSignal};
 use polygo_engine::health::HealthState;
 use polygo_engine::market::{ActiveMarket, MarketClock};
 use polygo_engine::runtime_config::StrategyStore;
+use polygo_engine::shadow::ShadowExitEngine;
 use polygo_engine::ws::binance::PriceTick;
 use polygo_engine::ws::polymarket::BookState;
 use tokio::sync::{mpsc, watch};
@@ -42,6 +43,11 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&health),
         Arc::clone(&strategy_store),
         execution_mode.as_str(),
+    );
+    let shadow_exit = ShadowExitEngine::new(
+        config.shadow.clone(),
+        Arc::clone(&book_state),
+        audit.clone(),
     );
     let (market_tx, market_rx) = watch::channel::<Option<ActiveMarket>>(None);
     let (binance_tx, binance_rx) = mpsc::channel::<PriceTick>(8_192);
@@ -83,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         execution_mode,
         live_executor,
         audit,
+        shadow_exit,
     ));
     let control_handle = tokio::spawn(polygo_engine::control::run(
         Arc::clone(&config),

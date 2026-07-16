@@ -73,6 +73,17 @@ pub async fn run(
             }
             continue;
         }
+        if !health.market_ready() {
+            if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                info!(
+                    reason = "market_not_ready",
+                    side = candidate.side.as_str(),
+                    momentum_usd = candidate.momentum_usd,
+                    "Momentum candidate rejected"
+                );
+            }
+            continue;
+        }
         if !market_clock.progress_allowed(received_at_ms, config.min_progress, config.max_progress)
         {
             if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
@@ -109,6 +120,11 @@ pub async fn run(
                     reason = "missing_book",
                     side = candidate.side.as_str(),
                     momentum_usd = candidate.momentum_usd,
+                    yes_bid = ?book.yes.bid,
+                    yes_ask = ?book.yes.ask,
+                    no_bid = ?book.no.bid,
+                    no_ask = ?book.no.ask,
+                    book_age_ms,
                     "Momentum candidate rejected"
                 );
             }
@@ -159,10 +175,14 @@ pub async fn run(
         }
         if engine_state.try_reserve().is_err() {
             if diagnostic_due(&mut last_diagnostic_log_ms, received_at_ms) {
+                let active = engine_state.active_snapshot();
                 info!(
                     reason = "position_reserved",
                     side = candidate.side.as_str(),
                     momentum_usd = candidate.momentum_usd,
+                    active_opened = active.opened,
+                    active_position_id = active.position_id,
+                    active_age_ms = active.age_ms,
                     "Momentum candidate rejected"
                 );
             }

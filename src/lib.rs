@@ -6,4 +6,5 @@ pub mod executor;
 pub mod health;
 pub mod market;
 pub mod runtime_config;
+pub mod shadow;
 pub mod ws;

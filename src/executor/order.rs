@@ -23,6 +23,7 @@ use crate::engine::state::{round_5, EngineState};
 use crate::health::HealthState;
 use crate::market::{now_ms, ActiveMarket, MarketClock};
 use crate::runtime_config::{StrategySnapshot, StrategyStore};
+use crate::shadow::{ShadowExitEngine, ShadowExitRequest};
 use crate::ws::polymarket::{BookSnapshot, BookState, DepthSnapshot, OutcomeBook};
 
 const DEFAULT_CLOB_API_URL: &str = "https://clob-v2.polymarket.com";
@@ -39,6 +40,16 @@ const LIVE_ENTRY_GTC_FAST_POLLS: u32 = 2;
 const LIVE_ENTRY_GTC_POLL_MS: u64 = 250;
 
 type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
+
+trait ElapsedToNowMs {
+    fn elapsed_to_now_ms(self) -> u64;
+}
+
+impl ElapsedToNowMs for u64 {
+    fn elapsed_to_now_ms(self) -> u64 {
+        now_ms().saturating_sub(self)
+    }
+}
 
 #[derive(Clone)]
 pub struct LiveExecutor {
@@ -96,15 +107,24 @@ impl LiveExecutor {
 
     async fn sell_shares(&self, token_id: U256, shares: f64) -> Result<PostOrderResponse> {
         let sellable_shares = floor_to_2_decimals(shares);
-        self.client
+        let started = std::time::Instant::now();
+        let response = self
+            .client
             .market_order()
             .token_id(token_id)
             .side(ClobSide::Sell)
             .amount(Amount::shares(decimal_from_f64(sellable_shares)?)?)
             .order_type(OrderType::FAK)
             .build_sign_and_post(&self.signer)
-            .await
-            .context("Polymarket sell order failed")
+            .await;
+        info!(
+            op = "sell_shares_fak",
+            total_ms = started.elapsed().as_millis() as u64,
+            success = response.as_ref().map(|response| response.success).unwrap_or(false),
+            error = response.is_err(),
+            "Polymarket live HTTP timing"
+        );
+        response.context("Polymarket sell order failed")
     }
 
     async fn place_gtc_buy(
@@ -140,6 +160,16 @@ impl LiveExecutor {
             .await
             .context("Polymarket GTC buy order post failed")?;
         let post_latency_ms = now_ms().saturating_sub(post_started_ms);
+        info!(
+            op = "place_gtc_buy",
+            build_ms = build_latency_ms,
+            sign_ms = sign_latency_ms,
+            post_ms = post_latency_ms,
+            total_ms = build_started_ms.elapsed_to_now_ms(),
+            success = response.success,
+            status = %response.status,
+            "Polymarket live HTTP timing"
+        );
         Ok(TimedPostOrderResponse {
             response,
             build_latency_ms,
@@ -173,16 +203,44 @@ impl LiveExecutor {
         shares: f64,
         limit_price: f64,
     ) -> Result<PostOrderResponse> {
-        self.client
+        let build_started_ms = now_ms();
+        let order = self
+            .client
             .limit_order()
             .token_id(token_id)
             .side(ClobSide::Sell)
             .price(decimal_from_f64(limit_price)?)
             .size(decimal_from_f64(shares)?)
             .order_type(OrderType::GTC)
-            .build_sign_and_post(&self.signer)
+            .build()
             .await
-            .context("Polymarket GTC sell order failed")
+            .context("Polymarket GTC sell order build failed")?;
+        let build_latency_ms = now_ms().saturating_sub(build_started_ms);
+        let sign_started_ms = now_ms();
+        let signed = self
+            .client
+            .sign(&self.signer, order)
+            .await
+            .context("Polymarket GTC sell order sign failed")?;
+        let sign_latency_ms = now_ms().saturating_sub(sign_started_ms);
+        let post_started_ms = now_ms();
+        let response = self
+            .client
+            .post_order(signed)
+            .await
+            .context("Polymarket GTC sell order post failed")?;
+        let post_latency_ms = now_ms().saturating_sub(post_started_ms);
+        info!(
+            op = "place_gtc_sell",
+            build_ms = build_latency_ms,
+            sign_ms = sign_latency_ms,
+            post_ms = post_latency_ms,
+            total_ms = build_started_ms.elapsed_to_now_ms(),
+            success = response.success,
+            status = %response.status,
+            "Polymarket live HTTP timing"
+        );
+        Ok(response)
     }
 }
 
@@ -284,6 +342,7 @@ pub async fn run(
     execution_mode: ExecutionMode,
     live_executor: Option<LiveExecutor>,
     audit: AuditEmitter,
+    shadow_exit: ShadowExitEngine,
 ) {
     info!(mode = execution_mode.as_str(), "Executor started");
     if let Some(live_executor) = live_executor.clone() {
@@ -309,6 +368,7 @@ pub async fn run(
         let task_store = Arc::clone(&strategy_store);
         let task_audit = audit.clone();
         let task_live_executor = live_executor.clone();
+        let task_shadow_exit = shadow_exit.clone();
         tokio::spawn(async move {
             match execution_mode {
                 ExecutionMode::DryRun => {
@@ -320,6 +380,7 @@ pub async fn run(
                         task_clock,
                         task_store,
                         task_audit,
+                        task_shadow_exit,
                     )
                     .await;
                 }
@@ -338,6 +399,7 @@ pub async fn run(
                         task_store,
                         live_executor,
                         task_audit,
+                        task_shadow_exit,
                     )
                     .await;
                 }
@@ -387,7 +449,18 @@ async fn execute_dry_run(
     market_clock: Arc<MarketClock>,
     strategy_store: Arc<StrategyStore>,
     audit: AuditEmitter,
+    shadow_exit: ShadowExitEngine,
 ) {
+    info!(
+        side = signal.side.as_str(),
+        signal_ts_ms = signal.signal_ts_ms,
+        "Execution task started"
+    );
+    info!(
+        side = signal.side.as_str(),
+        signal_ts_ms = signal.signal_ts_ms,
+        "Execution task started"
+    );
     tokio::time::sleep_until(signal.execute_at).await;
     let executed_at_ms = now_ms();
     if !health.is_running() {
@@ -459,6 +532,23 @@ async fn execute_dry_run(
         });
         return;
     };
+    if shadow_exit.enabled() {
+        let processing_ns = monotonic_ns();
+        shadow_exit.observe_exit(ShadowExitRequest {
+            position_id,
+            side: signal.side,
+            entry_ms: executed_at_ms,
+            decision_ms: exit_at_ms,
+            exit_reason: "max_hold",
+            entry_price: ask,
+            shares: shares as f64,
+            decision_processing_started_ns: processing_ns,
+            decision_processing_finished_ns: monotonic_ns(),
+            event_receive_ns: processing_ns,
+            event_exchange_timestamp_ms: book.source_ts_ms,
+            book_age_ms: exit_at_ms.saturating_sub(book.received_at_ms),
+        });
+    }
     let closed = engine_state.close(ask, exit_price, shares);
     let _ = audit.emit(AuditEvent::exit(position_id, signal.side.as_str(), closed));
 }
@@ -473,6 +563,7 @@ async fn execute_live(
     strategy_store: Arc<StrategyStore>,
     live_executor: LiveExecutor,
     audit: AuditEmitter,
+    shadow_exit: ShadowExitEngine,
 ) {
     tokio::time::sleep_until(signal.execute_at).await;
     let executed_at_ms = now_ms();
@@ -688,6 +779,14 @@ async fn execute_live(
     let entry_order_status = entry.order_status.unwrap_or_else(|| "UNKNOWN".to_owned());
     let entry_price = entry_notional_usd / filled_shares;
     let position_id = engine_state.open_reserved();
+    info!(
+        position_id,
+        side = signal.side.as_str(),
+        entry_price = round_5(entry_price),
+        shares = round_5(filled_shares),
+        order_status = %entry_order_status,
+        "Live entry opened"
+    );
     let _ = audit.emit(AuditEvent::LiveEntry {
         position_id,
         signal_ts_ms: signal.signal_ts_ms,
@@ -746,6 +845,24 @@ async fn execute_live(
             context: Some(exit_context.clone()),
         });
         return;
+    }
+
+    if shadow_exit.enabled() {
+        let processing_ns = monotonic_ns();
+        shadow_exit.observe_exit(ShadowExitRequest {
+            position_id,
+            side: signal.side,
+            entry_ms: confirmed_at_ms,
+            decision_ms: exit_at_ms,
+            exit_reason: "max_hold",
+            entry_price,
+            shares: sellable_shares,
+            decision_processing_started_ns: processing_ns,
+            decision_processing_finished_ns: monotonic_ns(),
+            event_receive_ns: processing_ns,
+            event_exchange_timestamp_ms: book.source_ts_ms,
+            book_age_ms: exit_at_ms.saturating_sub(book.received_at_ms),
+        });
     }
 
     let mut sold_shares = 0.0;
@@ -857,6 +974,14 @@ async fn execute_live(
     };
     let exit_price = sale_proceeds / sold_shares;
     let closed = engine_state.close_live(entry_price, exit_price, sold_shares);
+    info!(
+        position_id,
+        side = signal.side.as_str(),
+        exit_price = round_5(exit_price),
+        shares = closed.shares,
+        net_pnl = closed.net_pnl,
+        "Live exit closed"
+    );
     let _ = audit.emit(AuditEvent::LiveExit {
         position_id,
         closed_at_ms: now_ms(),
@@ -965,9 +1090,23 @@ async fn buy_with_gtc_limit(
     for _ in 0..max_polls {
         result.poll_count += 1;
         tokio::time::sleep(tokio::time::Duration::from_millis(LIVE_ENTRY_GTC_POLL_MS)).await;
+        let status_started_ms = now_ms();
         let order = match live_executor.client.order(&order_id).await {
-            Ok(order) => order,
+            Ok(order) => {
+                info!(
+                    op = "gtc_entry_order_status",
+                    total_ms = status_started_ms.elapsed_to_now_ms(),
+                    "Polymarket live HTTP timing"
+                );
+                order
+            }
             Err(error) => {
+                info!(
+                    op = "gtc_entry_order_status",
+                    total_ms = status_started_ms.elapsed_to_now_ms(),
+                    error = true,
+                    "Polymarket live HTTP timing"
+                );
                 result.error = Some(format!("GTC entry status failed: {error:#}"));
                 result.pending = true;
                 return result;
@@ -988,9 +1127,23 @@ async fn buy_with_gtc_limit(
         }
     }
 
+    let cancel_started_ms = now_ms();
     let cancellation = match live_executor.client.cancel_order(&order_id).await {
-        Ok(cancellation) => cancellation,
+        Ok(cancellation) => {
+            info!(
+                op = "gtc_entry_cancel",
+                total_ms = cancel_started_ms.elapsed_to_now_ms(),
+                "Polymarket live HTTP timing"
+            );
+            cancellation
+        }
         Err(error) => {
+            info!(
+                op = "gtc_entry_cancel",
+                total_ms = cancel_started_ms.elapsed_to_now_ms(),
+                error = true,
+                "Polymarket live HTTP timing"
+            );
             result.error = Some(format!("GTC entry cancel failed: {error:#}"));
             result.pending = true;
             return result;
@@ -1001,9 +1154,23 @@ async fn buy_with_gtc_limit(
         .iter()
         .any(|canceled_id| canceled_id == &order_id);
     result.cancel_confirmed = Some(cancellation_confirmed);
+    let final_status_started_ms = now_ms();
     let final_order = match live_executor.client.order(&order_id).await {
-        Ok(order) => order,
+        Ok(order) => {
+            info!(
+                op = "gtc_entry_final_status",
+                total_ms = final_status_started_ms.elapsed_to_now_ms(),
+                "Polymarket live HTTP timing"
+            );
+            order
+        }
         Err(error) => {
+            info!(
+                op = "gtc_entry_final_status",
+                total_ms = final_status_started_ms.elapsed_to_now_ms(),
+                error = true,
+                "Polymarket live HTTP timing"
+            );
             result.error = Some(format!(
                 "GTC entry canceled order fill could not be verified: {error:#}"
             ));
@@ -1094,9 +1261,23 @@ async fn sell_with_gtc_fallback(
         };
         for _ in 0..poll_attempts {
             tokio::time::sleep(tokio::time::Duration::from_millis(LIVE_EXIT_GTC_POLL_MS)).await;
+            let status_started_ms = now_ms();
             let order = match live_executor.client.order(&order_id).await {
-                Ok(order) => order,
+                Ok(order) => {
+                    info!(
+                        op = "gtc_exit_order_status",
+                        total_ms = status_started_ms.elapsed_to_now_ms(),
+                        "Polymarket live HTTP timing"
+                    );
+                    order
+                }
                 Err(error) => {
+                    info!(
+                        op = "gtc_exit_order_status",
+                        total_ms = status_started_ms.elapsed_to_now_ms(),
+                        error = true,
+                        "Polymarket live HTTP timing"
+                    );
                     result.error = Some(format!("GTC order status failed: {error:#}"));
                     result.pending = true;
                     return result;
@@ -1121,9 +1302,23 @@ async fn sell_with_gtc_fallback(
             return result;
         }
 
+        let cancel_started_ms = now_ms();
         let cancellation = match live_executor.client.cancel_order(&order_id).await {
-            Ok(cancellation) => cancellation,
+            Ok(cancellation) => {
+                info!(
+                    op = "gtc_exit_cancel",
+                    total_ms = cancel_started_ms.elapsed_to_now_ms(),
+                    "Polymarket live HTTP timing"
+                );
+                cancellation
+            }
             Err(error) => {
+                info!(
+                    op = "gtc_exit_cancel",
+                    total_ms = cancel_started_ms.elapsed_to_now_ms(),
+                    error = true,
+                    "Polymarket live HTTP timing"
+                );
                 result.error = Some(format!("GTC cancel failed: {error:#}"));
                 result.pending = true;
                 return result;
@@ -1133,9 +1328,23 @@ async fn sell_with_gtc_fallback(
             .canceled
             .iter()
             .any(|canceled_id| canceled_id == &order_id);
+        let final_status_started_ms = now_ms();
         let final_order = match live_executor.client.order(&order_id).await {
-            Ok(order) => order,
+            Ok(order) => {
+                info!(
+                    op = "gtc_exit_final_status",
+                    total_ms = final_status_started_ms.elapsed_to_now_ms(),
+                    "Polymarket live HTTP timing"
+                );
+                order
+            }
             Err(error) => {
+                info!(
+                    op = "gtc_exit_final_status",
+                    total_ms = final_status_started_ms.elapsed_to_now_ms(),
+                    error = true,
+                    "Polymarket live HTTP timing"
+                );
                 result.error = Some(format!(
                     "GTC canceled order fill could not be verified: {error:#}"
                 ));
@@ -1200,6 +1409,12 @@ fn reject(
     audit: &AuditEmitter,
 ) {
     engine_state.release_reservation();
+    info!(
+        signal_ts_ms = signal.signal_ts_ms,
+        side = signal.side.as_str(),
+        reason,
+        "Execution rejected"
+    );
     let _ = audit.emit(AuditEvent::ExecutionRejected {
         signal_ts_ms: signal.signal_ts_ms,
         side: signal.side.as_str(),
@@ -1216,6 +1431,12 @@ fn reject_with_context(
     context: Option<AuditBookContext>,
 ) {
     engine_state.release_reservation();
+    info!(
+        signal_ts_ms = signal.signal_ts_ms,
+        side = signal.side.as_str(),
+        reason,
+        "Execution rejected"
+    );
     let _ = audit.emit(AuditEvent::ExecutionRejected {
         signal_ts_ms: signal.signal_ts_ms,
         side: signal.side.as_str(),
@@ -1365,6 +1586,11 @@ fn decimal_to_f64(value: Decimal) -> Option<f64> {
 
 fn env_nonempty(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn monotonic_ns() -> u128 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos()
 }
 
 fn parse_signature_type(value: Option<&str>, has_funder: bool) -> Result<SignatureType> {
