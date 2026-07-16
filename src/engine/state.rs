@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
+use crate::market::now_ms;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClosedPosition {
     pub entry_price: f64,
@@ -22,11 +24,21 @@ pub struct ClosedLivePosition {
     pub net_pnl: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivePositionSnapshot {
+    pub active: bool,
+    pub opened: bool,
+    pub position_id: u64,
+    pub age_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct EngineState {
     open_or_reserved: AtomicUsize,
     next_position_id: AtomicU64,
     max_open_positions: usize,
+    reserved_at_ms: AtomicU64,
+    opened_position_id: AtomicU64,
     daily_loss_limit_microusd: AtomicU64,
     daily_loss_microusd: AtomicU64,
     total_pnl_microusd: AtomicI64,
@@ -39,6 +51,8 @@ impl EngineState {
             open_or_reserved: AtomicUsize::new(0),
             next_position_id: AtomicU64::new(1),
             max_open_positions,
+            reserved_at_ms: AtomicU64::new(0),
+            opened_position_id: AtomicU64::new(0),
             daily_loss_limit_microusd: AtomicU64::new(to_microusd(daily_loss_limit_usd)),
             daily_loss_microusd: AtomicU64::new(0),
             total_pnl_microusd: AtomicI64::new(0),
@@ -57,13 +71,34 @@ impl EngineState {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current == 0 && self.max_open_positions > 0).then_some(current + 1)
             })
-            .map(|_| ())
+            .map(|_| {
+                self.reserved_at_ms.store(now_ms(), Ordering::Release);
+                self.opened_position_id.store(0, Ordering::Release);
+            })
             .map_err(|_| "position_active")
     }
 
     #[inline(always)]
     pub fn release_reservation(&self) {
+        self.opened_position_id.store(0, Ordering::Release);
+        self.reserved_at_ms.store(0, Ordering::Release);
         self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    pub fn active_snapshot(&self) -> ActivePositionSnapshot {
+        let active = self.open_or_reserved.load(Ordering::Acquire) > 0;
+        let reserved_at_ms = self.reserved_at_ms.load(Ordering::Acquire);
+        let position_id = self.opened_position_id.load(Ordering::Acquire);
+        ActivePositionSnapshot {
+            active,
+            opened: position_id > 0,
+            position_id,
+            age_ms: if active && reserved_at_ms > 0 {
+                now_ms().saturating_sub(reserved_at_ms)
+            } else {
+                0
+            },
+        }
     }
 
     pub fn set_daily_loss_limit_usd(&self, daily_loss_limit_usd: f64) {
@@ -73,7 +108,9 @@ impl EngineState {
 
     pub fn open_reserved(&self) -> u64 {
         self.total_trades.fetch_add(1, Ordering::Relaxed);
-        self.next_position_id.fetch_add(1, Ordering::Relaxed)
+        let position_id = self.next_position_id.fetch_add(1, Ordering::Relaxed);
+        self.opened_position_id.store(position_id, Ordering::Release);
+        position_id
     }
 
     pub fn close(&self, entry_price: f64, exit_price: f64, shares: u64) -> ClosedPosition {
@@ -116,6 +153,8 @@ impl EngineState {
                 .fetch_add(to_microusd(net_pnl.abs()), Ordering::AcqRel);
         }
         add_signed_microusd(&self.total_pnl_microusd, net_pnl);
+        self.opened_position_id.store(0, Ordering::Release);
+        self.reserved_at_ms.store(0, Ordering::Release);
         self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
     }
 }

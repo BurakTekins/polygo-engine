@@ -248,13 +248,12 @@ pub async fn run(
                                     book_state.store(snapshot);
                                     book_state.store_depth(&depth);
                                     health.mark_book(received_at_ms);
-                                    if snapshot.yes.bid.is_some()
-                                        && snapshot.yes.ask.is_some()
-                                        && snapshot.no.bid.is_some()
-                                        && snapshot.no.ask.is_some()
-                                    {
-                                        health.set_market_ready(true);
-                                    }
+                                    health.set_market_ready(
+                                        snapshot.yes.bid.is_some()
+                                            && snapshot.yes.ask.is_some()
+                                            && snapshot.no.bid.is_some()
+                                            && snapshot.no.ask.is_some(),
+                                    );
                                 }
                                 Ok(false) => {}
                                 Err(error) => warn!(%error, "Invalid Polymarket payload"),

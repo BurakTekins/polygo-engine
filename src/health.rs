@@ -75,6 +75,11 @@ impl HealthState {
     }
 
     #[inline(always)]
+    pub fn market_ready(&self) -> bool {
+        self.market_ready.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
     pub fn mark_binance(&self, now_ms: u64) {
         self.last_binance_ms.store(now_ms, Ordering::Relaxed);
     }

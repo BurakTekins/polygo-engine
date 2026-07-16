@@ -11,6 +11,8 @@ pub struct EngineConfig {
     pub risk: RiskConfig,
     pub integration: IntegrationConfig,
     pub control: ControlConfig,
+    #[serde(flatten, default)]
+    pub shadow: ShadowConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -78,6 +80,37 @@ pub struct ControlConfig {
     pub bind_addr: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShadowConfig {
+    pub shadow_exit_enabled: bool,
+    pub shadow_submit_real_orders: bool,
+    pub shadow_execution_latency_ms: u64,
+    pub shadow_maker_wait_ms: u64,
+    pub shadow_queue_ratio_threshold: f64,
+    pub shadow_cancel_latency_ms: u64,
+    pub shadow_fallback_taker_latency_ms: u64,
+    pub shadow_limit_strategy: String,
+    pub shadow_fill_model: String,
+    pub shadow_guard_mode: String,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            shadow_exit_enabled: false,
+            shadow_submit_real_orders: false,
+            shadow_execution_latency_ms: 500,
+            shadow_maker_wait_ms: 500,
+            shadow_queue_ratio_threshold: 1.0,
+            shadow_cancel_latency_ms: 612,
+            shadow_fallback_taker_latency_ms: 612,
+            shadow_limit_strategy: "best_bid_plus_tick".to_owned(),
+            shadow_fill_model: "trade_only_conservative".to_owned(),
+            shadow_guard_mode: "none".to_owned(),
+        }
+    }
+}
+
 impl EngineConfig {
     pub fn load(path: &str) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -136,6 +169,20 @@ impl EngineConfig {
         }
         if self.control.bind_addr.is_empty() {
             bail!("invalid control config");
+        }
+        let shadow = &self.shadow;
+        if shadow.shadow_submit_real_orders
+            || shadow.shadow_execution_latency_ms == 0
+            || shadow.shadow_maker_wait_ms == 0
+            || !shadow.shadow_queue_ratio_threshold.is_finite()
+            || shadow.shadow_queue_ratio_threshold < 0.0
+            || shadow.shadow_cancel_latency_ms == 0
+            || shadow.shadow_fallback_taker_latency_ms == 0
+            || shadow.shadow_limit_strategy != "best_bid_plus_tick"
+            || shadow.shadow_fill_model != "trade_only_conservative"
+            || shadow.shadow_guard_mode != "none"
+        {
+            bail!("invalid shadow exit config");
         }
         Ok(())
     }

@@ -38,5 +38,15 @@
   },
   "control": {
     "bind_addr": "0.0.0.0:8090"
-  }
+  },
+  "shadow_exit_enabled": true,
+  "shadow_submit_real_orders": false,
+  "shadow_execution_latency_ms": 500,
+  "shadow_maker_wait_ms": 500,
+  "shadow_queue_ratio_threshold": 1.0,
+  "shadow_cancel_latency_ms": 612,
+  "shadow_fallback_taker_latency_ms": 612,
+  "shadow_limit_strategy": "best_bid_plus_tick",
+  "shadow_fill_model": "trade_only_conservative",
+  "shadow_guard_mode": "none"
 }
