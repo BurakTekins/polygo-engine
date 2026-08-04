@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use serde::Serialize;
+use tokio::sync::broadcast;
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::config::ShadowConfig;
@@ -8,7 +9,9 @@ use crate::emitter::audit::{AuditEmitter, AuditEvent};
 use crate::engine::state::{round_5, taker_fee_decimal};
 use crate::executor::order::OrderSide;
 use crate::market::now_ms;
-use crate::ws::polymarket::{BookSnapshot, BookState, DepthSnapshot, OutcomeDepth};
+use crate::ws::polymarket::{
+    BookSnapshot, BookState, DepthSnapshot, OutcomeDepth, TradePrint, TradeSide,
+};
 
 const PRICE_TICK: f64 = 0.01;
 
@@ -38,24 +41,42 @@ impl ShadowExitEngine {
             return;
         }
         let engine = self.clone();
+        let policy_e_trades = self.book_state.subscribe_trades();
+        let policy_d_trades = self.book_state.subscribe_trades();
         tokio::spawn(async move {
-            let record = engine.simulate(request).await;
+            let record = engine
+                .simulate(request, policy_e_trades, policy_d_trades)
+                .await;
             let _ = engine.audit.emit(AuditEvent::ShadowExitResult {
                 record: Box::new(record),
             });
         });
     }
 
-    async fn simulate(&self, request: ShadowExitRequest) -> ShadowExitRecord {
-        let mut baseline = self.simulate_taker(&request, "same_latency_taker").await;
+    async fn simulate(
+        &self,
+        request: ShadowExitRequest,
+        policy_e_trades: broadcast::Receiver<TradePrint>,
+        policy_d_trades: broadcast::Receiver<TradePrint>,
+    ) -> ShadowExitRecord {
+        let baseline = self.simulate_taker(&request, "same_latency_taker");
+        let policy_e = self.simulate_policy(&request, ShadowPolicy::PolicyE, policy_e_trades);
+        let policy_d = self.simulate_policy(&request, ShadowPolicy::PolicyD, policy_d_trades);
+        let (mut baseline, mut policy_e, mut policy_d) = tokio::join!(baseline, policy_e, policy_d);
         baseline.policy_positive = baseline.pnl.net_pnl > 0.0;
         baseline.baseline_positive = baseline.policy_positive;
-        let mut policy_e = self.simulate_policy(&request, ShadowPolicy::PolicyE).await;
-        let mut policy_d = self.simulate_policy(&request, ShadowPolicy::PolicyD).await;
         let policy_e_diff_vs_baseline = diff(&policy_e.pnl, &baseline.pnl);
         let policy_d_diff_vs_baseline = diff(&policy_d.pnl, &baseline.pnl);
-        annotate_policy(&mut policy_e, baseline.pnl.net_pnl, policy_e_diff_vs_baseline.net_pnl_diff);
-        annotate_policy(&mut policy_d, baseline.pnl.net_pnl, policy_d_diff_vs_baseline.net_pnl_diff);
+        annotate_policy(
+            &mut policy_e,
+            baseline.pnl.net_pnl,
+            policy_e_diff_vs_baseline.net_pnl_diff,
+        );
+        annotate_policy(
+            &mut policy_d,
+            baseline.pnl.net_pnl,
+            policy_d_diff_vs_baseline.net_pnl_diff,
+        );
         ShadowExitRecord {
             position_id: request.position_id,
             side: request.side.as_str(),
@@ -90,11 +111,19 @@ impl ShadowExitEngine {
         }
     }
 
-    async fn simulate_taker(&self, request: &ShadowExitRequest, policy: &'static str) -> ShadowPolicyResult {
+    async fn simulate_taker(
+        &self,
+        request: &ShadowExitRequest,
+        policy: &'static str,
+    ) -> ShadowPolicyResult {
         let active_ms = request
             .decision_ms
             .saturating_add(self.config.shadow_execution_latency_ms);
-        sleep_until(deadline_from_now(request.decision_ms, self.config.shadow_execution_latency_ms)).await;
+        sleep_until(deadline_from_now(
+            request.decision_ms,
+            self.config.shadow_execution_latency_ms,
+        ))
+        .await;
         let mut result = ShadowPolicyResult::new(policy);
         result.state = ShadowState::TakerPending;
         match executable_bid_vwap(
@@ -109,8 +138,16 @@ impl ShadowExitEngine {
                 result.fallback_taker_shares = round_5(request.shares);
                 result.outcome = ShadowOutcome::TakerBypass;
                 result.state = ShadowState::Completed;
-                result.pnl = pnl(request.entry_price, request.shares, 0.0, 0.0, request.shares, fill.vwap);
-                result.decision_to_completion_ms = Some(active_ms.saturating_sub(request.decision_ms));
+                result.pnl = pnl(
+                    request.entry_price,
+                    request.shares,
+                    0.0,
+                    0.0,
+                    request.shares,
+                    fill.vwap,
+                );
+                result.decision_to_completion_ms =
+                    Some(active_ms.saturating_sub(request.decision_ms));
             }
             Err(_) => {
                 result.outcome = ShadowOutcome::InsufficientFutureData;
@@ -121,7 +158,12 @@ impl ShadowExitEngine {
         result
     }
 
-    async fn simulate_policy(&self, request: &ShadowExitRequest, policy: ShadowPolicy) -> ShadowPolicyResult {
+    async fn simulate_policy(
+        &self,
+        request: &ShadowExitRequest,
+        policy: ShadowPolicy,
+        mut trades: broadcast::Receiver<TradePrint>,
+    ) -> ShadowPolicyResult {
         if !policy_uses_maker(policy, request.exit_reason) {
             return self.simulate_taker(request, policy.as_str()).await;
         }
@@ -130,9 +172,10 @@ impl ShadowExitEngine {
             .decision_ms
             .saturating_add(self.config.shadow_execution_latency_ms);
         let maker_timeout_ms = maker_active_ms.saturating_add(self.config.shadow_maker_wait_ms);
-        let cancel_effective_ms = maker_timeout_ms.saturating_add(self.config.shadow_cancel_latency_ms);
-        let fallback_taker_active_ms = cancel_effective_ms
-            .saturating_add(self.config.shadow_fallback_taker_latency_ms);
+        let cancel_effective_ms =
+            maker_timeout_ms.saturating_add(self.config.shadow_cancel_latency_ms);
+        let fallback_taker_active_ms =
+            cancel_effective_ms.saturating_add(self.config.shadow_fallback_taker_latency_ms);
 
         let mut result = ShadowPolicyResult::new(policy.as_str());
         result.timeline = ShadowPolicyTimeline {
@@ -143,7 +186,11 @@ impl ShadowExitEngine {
         };
         result.state = ShadowState::PendingActivation;
 
-        sleep_until(deadline_from_now(request.decision_ms, self.config.shadow_execution_latency_ms)).await;
+        sleep_until(deadline_from_now(
+            request.decision_ms,
+            self.config.shadow_execution_latency_ms,
+        ))
+        .await;
         let book = self.book_state.load();
         let depth = self.book_state.load_depth();
         if stale_at(book.received_at_ms, maker_active_ms) {
@@ -165,7 +212,9 @@ impl ShadowExitEngine {
         if best_ask.is_some_and(|ask| limit_price + 0.00001 >= ask) {
             result.outcome = ShadowOutcome::PostOnlyRejected;
             result.selection_reason = "post_only_rejected";
-            return self.complete_fallback_taker(request, result, fallback_taker_active_ms).await;
+            return self
+                .complete_fallback_taker(request, result, fallback_taker_active_ms)
+                .await;
         }
         let queue_ahead = ask_queue_ahead(selected_depth, limit_price);
         let queue_ratio = if request.shares > 0.0 {
@@ -179,16 +228,80 @@ impl ShadowExitEngine {
         if queue_ratio > self.config.shadow_queue_ratio_threshold {
             result.selection_reason = "queue_ratio_above_threshold";
             result.outcome = ShadowOutcome::TakerBypass;
-            return self.complete_fallback_taker(request, result, maker_active_ms).await;
+            return self
+                .complete_fallback_taker(request, result, maker_active_ms)
+                .await;
         }
 
         result.selected_for_maker = true;
         result.selection_reason = "queue_ratio_within_threshold";
         result.state = ShadowState::MakerResting;
-        sleep_until(deadline_from_now(request.decision_ms, self.config.shadow_execution_latency_ms + self.config.shadow_maker_wait_ms)).await;
+        let maker_deadline = deadline_from_now(
+            request.decision_ms,
+            self.config.shadow_execution_latency_ms + self.config.shadow_maker_wait_ms,
+        );
+        let mut traded_at_or_above = 0.0;
+        loop {
+            tokio::select! {
+                _ = sleep_until(maker_deadline) => break,
+                trade = trades.recv() => {
+                    match trade {
+                        Ok(trade) if trade_supports_sell_fill(trade, request.side, limit_price, maker_active_ms, maker_timeout_ms) => {
+                            traded_at_or_above += trade.size;
+                            let filled = (traded_at_or_above - queue_ahead)
+                                .max(0.0)
+                                .min(request.shares);
+                            result.maker_filled_shares = round_5(filled);
+                            if filled > 0.0 {
+                                result.maker_fill_vwap = Some(limit_price);
+                            }
+                            if filled + 0.00001 >= request.shares {
+                                result.outcome = ShadowOutcome::FullFillTradeSupported;
+                                result.state = ShadowState::Completed;
+                                result.pnl = pnl(
+                                    request.entry_price,
+                                    request.shares,
+                                    request.shares,
+                                    limit_price,
+                                    0.0,
+                                    0.0,
+                                );
+                                result.decision_to_completion_ms = Some(
+                                    trade.received_at_ms.saturating_sub(request.decision_ms),
+                                );
+                                result.maker_active_to_completion_ms = Some(
+                                    trade.received_at_ms.saturating_sub(maker_active_ms),
+                                );
+                                return result;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            result.outcome = ShadowOutcome::InsufficientFutureData;
+                            result.selection_reason = "trade_stream_lagged";
+                            result.state = ShadowState::InsufficientData;
+                            return result;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            result.outcome = ShadowOutcome::InsufficientFutureData;
+                            result.selection_reason = "trade_stream_closed";
+                            result.state = ShadowState::InsufficientData;
+                            return result;
+                        }
+                    }
+                }
+            }
+        }
         result.state = ShadowState::CancelPending;
-        sleep_until(deadline_from_now(request.decision_ms, self.config.shadow_execution_latency_ms + self.config.shadow_maker_wait_ms + self.config.shadow_cancel_latency_ms)).await;
-        self.complete_fallback_taker(request, result, fallback_taker_active_ms).await
+        sleep_until(deadline_from_now(
+            request.decision_ms,
+            self.config.shadow_execution_latency_ms
+                + self.config.shadow_maker_wait_ms
+                + self.config.shadow_cancel_latency_ms,
+        ))
+        .await;
+        self.complete_fallback_taker(request, result, fallback_taker_active_ms)
+            .await
     }
 
     async fn complete_fallback_taker(
@@ -213,7 +326,9 @@ impl ShadowExitEngine {
             Ok(fill) => {
                 result.fallback_taker_vwap = Some(round_5(fill.vwap));
                 result.fallback_taker_shares = round_5(remaining);
-                result.outcome = if result.selected_for_maker {
+                result.outcome = if result.maker_filled_shares > 0.0 {
+                    ShadowOutcome::PartialFillTradeSupported
+                } else if result.selected_for_maker {
                     ShadowOutcome::ZeroFillTimeoutFallback
                 } else if result.outcome == ShadowOutcome::PostOnlyRejected {
                     ShadowOutcome::PostOnlyRejected
@@ -229,7 +344,8 @@ impl ShadowExitEngine {
                     remaining,
                     fill.vwap,
                 );
-                result.decision_to_completion_ms = Some(active_ms.saturating_sub(request.decision_ms));
+                result.decision_to_completion_ms =
+                    Some(active_ms.saturating_sub(request.decision_ms));
                 result.maker_active_to_completion_ms = result
                     .timeline
                     .maker_active_ms
@@ -422,8 +538,25 @@ struct VwapFill {
 fn policy_uses_maker(policy: ShadowPolicy, exit_reason: &str) -> bool {
     match policy {
         ShadowPolicy::PolicyE => exit_reason == "profit_reversal",
-        ShadowPolicy::PolicyD => exit_reason == "momentum_reversal" || exit_reason == "profit_reversal",
+        ShadowPolicy::PolicyD => {
+            exit_reason == "momentum_reversal" || exit_reason == "profit_reversal"
+        }
     }
+}
+
+fn trade_supports_sell_fill(
+    trade: TradePrint,
+    side: OrderSide,
+    limit_price: f64,
+    maker_active_ms: u64,
+    maker_timeout_ms: u64,
+) -> bool {
+    let selected_is_yes = side == OrderSide::BuyYes;
+    trade.is_yes == selected_is_yes
+        && trade.side == TradeSide::Buy
+        && trade.price + 0.00001 >= limit_price
+        && trade.received_at_ms >= maker_active_ms
+        && trade.received_at_ms <= maker_timeout_ms
 }
 
 fn deadline_from_now(decision_ms: u64, delay_ms: u64) -> Instant {

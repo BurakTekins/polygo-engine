@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::config::EngineConfig;
+use crate::config::{EngineConfig, ExecutionMode};
 use crate::engine::state::EngineState;
 use crate::health::HealthState;
 use crate::runtime_config::{JavaStrategyConfig, StrategyStore};
@@ -15,6 +15,7 @@ use crate::runtime_config::{JavaStrategyConfig, StrategyStore};
 const MAX_REQUEST_BYTES: usize = 16_384;
 
 struct ControlContext {
+    execution_mode: ExecutionMode,
     health: Arc<HealthState>,
     engine_state: Arc<EngineState>,
     strategy_store: Arc<StrategyStore>,
@@ -67,16 +68,25 @@ pub async fn run(
 ) -> Result<()> {
     let listener = TcpListener::bind(&config.control.bind_addr).await?;
     info!(bind = %config.control.bind_addr, "Control plane listening");
-    serve(listener, health, engine_state, strategy_store).await
+    serve(
+        listener,
+        config.execution_mode,
+        health,
+        engine_state,
+        strategy_store,
+    )
+    .await
 }
 
 async fn serve(
     listener: TcpListener,
+    execution_mode: ExecutionMode,
     health: Arc<HealthState>,
     engine_state: Arc<EngineState>,
     strategy_store: Arc<StrategyStore>,
 ) -> Result<()> {
     let context = Arc::new(ControlContext {
+        execution_mode,
         health,
         engine_state,
         strategy_store,
@@ -169,7 +179,14 @@ async fn start(request: &HttpRequest, context: &ControlContext) -> HttpResponse 
             return HttpResponse::error("400 Bad Request", error);
         }
     };
-    let _requested_mode = request.mode;
+    let requested_mode = match request.mode {
+        TradingMode::DryRun => ExecutionMode::DryRun,
+        TradingMode::Live => ExecutionMode::Live,
+    };
+    if requested_mode != context.execution_mode {
+        context.health.stop();
+        return HttpResponse::error("409 Conflict", "execution_mode_mismatch");
+    }
     if !valid_config_version(&request.config_version) {
         context.health.stop();
         return HttpResponse::error("422 Unprocessable Entity", "invalid_start_request");
@@ -329,6 +346,7 @@ mod tests {
         health.set_market_ready(true);
         let server = tokio::spawn(serve(
             listener,
+            config.execution_mode,
             Arc::clone(&health),
             Arc::clone(&engine_state),
             Arc::clone(&strategy_store),
@@ -365,6 +383,7 @@ mod tests {
             .status,
             204
         );
+        assert!(!health.is_running());
         let configured = request(address, "GET", "/v1/health", None).await;
         assert_eq!(configured.json["configVersion"], "momentum-v1");
 
@@ -439,8 +458,9 @@ mod tests {
             )
             .await
             .status,
-            204
+            409
         );
+        assert!(!health.is_running());
         assert_eq!(
             request(
                 address,
@@ -492,6 +512,7 @@ mod tests {
         health.set_market_ready(true);
         let server = tokio::spawn(serve(
             listener,
+            config.execution_mode,
             Arc::clone(&health),
             Arc::clone(&engine_state),
             Arc::clone(&strategy_store),
@@ -633,6 +654,7 @@ mod tests {
                 java_audit_endpoint: None,
             },
             control: ControlConfig { bind_addr },
+            shadow: Default::default(),
         }
     }
 }

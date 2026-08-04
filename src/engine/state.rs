@@ -40,7 +40,8 @@ pub struct EngineState {
     reserved_at_ms: AtomicU64,
     opened_position_id: AtomicU64,
     daily_loss_limit_microusd: AtomicU64,
-    daily_loss_microusd: AtomicU64,
+    daily_epoch_day: AtomicU64,
+    daily_pnl_microusd: AtomicI64,
     total_pnl_microusd: AtomicI64,
     total_trades: AtomicU64,
 }
@@ -54,7 +55,8 @@ impl EngineState {
             reserved_at_ms: AtomicU64::new(0),
             opened_position_id: AtomicU64::new(0),
             daily_loss_limit_microusd: AtomicU64::new(to_microusd(daily_loss_limit_usd)),
-            daily_loss_microusd: AtomicU64::new(0),
+            daily_epoch_day: AtomicU64::new(epoch_day(now_ms())),
+            daily_pnl_microusd: AtomicI64::new(0),
             total_pnl_microusd: AtomicI64::new(0),
             total_trades: AtomicU64::new(0),
         }
@@ -62,8 +64,9 @@ impl EngineState {
 
     #[inline(always)]
     pub fn try_reserve(&self) -> Result<(), &'static str> {
-        if self.daily_loss_microusd.load(Ordering::Acquire)
-            >= self.daily_loss_limit_microusd.load(Ordering::Acquire)
+        self.refresh_daily_pnl(now_ms());
+        if self.daily_pnl_microusd.load(Ordering::Acquire)
+            <= -(self.daily_loss_limit_microusd.load(Ordering::Acquire) as i64)
         {
             return Err("daily_loss_limit");
         }
@@ -109,7 +112,8 @@ impl EngineState {
     pub fn open_reserved(&self) -> u64 {
         self.total_trades.fetch_add(1, Ordering::Relaxed);
         let position_id = self.next_position_id.fetch_add(1, Ordering::Relaxed);
-        self.opened_position_id.store(position_id, Ordering::Release);
+        self.opened_position_id
+            .store(position_id, Ordering::Release);
         position_id
     }
 
@@ -148,14 +152,27 @@ impl EngineState {
     }
 
     fn record_close(&self, net_pnl: f64) {
-        if net_pnl < 0.0 {
-            self.daily_loss_microusd
-                .fetch_add(to_microusd(net_pnl.abs()), Ordering::AcqRel);
-        }
+        self.refresh_daily_pnl(now_ms());
+        add_signed_microusd(&self.daily_pnl_microusd, net_pnl);
         add_signed_microusd(&self.total_pnl_microusd, net_pnl);
         self.opened_position_id.store(0, Ordering::Release);
         self.reserved_at_ms.store(0, Ordering::Release);
         self.open_or_reserved.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn refresh_daily_pnl(&self, now_ms: u64) {
+        let today = epoch_day(now_ms);
+        let current = self.daily_epoch_day.load(Ordering::Acquire);
+        if current == today {
+            return;
+        }
+        if self
+            .daily_epoch_day
+            .compare_exchange(current, today, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.daily_pnl_microusd.store(0, Ordering::Release);
+        }
     }
 }
 
@@ -173,6 +190,10 @@ pub fn round_5(value: f64) -> f64 {
 
 fn to_microusd(value: f64) -> u64 {
     (value * 1_000_000.0).round() as u64
+}
+
+fn epoch_day(timestamp_ms: u64) -> u64 {
+    timestamp_ms / 86_400_000
 }
 
 fn add_signed_microusd(target: &AtomicI64, value: f64) {
@@ -211,6 +232,20 @@ mod tests {
         state.close(0.50, 0.40, 100);
         assert_eq!(state.try_reserve(), Err("daily_loss_limit"));
         state.set_daily_loss_limit_usd(20.0);
+        assert!(state.try_reserve().is_ok());
+    }
+
+    #[test]
+    fn daily_limit_uses_net_realized_pnl() {
+        let state = EngineState::new(1, 5.0);
+        state.try_reserve().unwrap();
+        state.open_reserved();
+        state.close(0.30, 0.40, 100);
+
+        state.try_reserve().unwrap();
+        state.open_reserved();
+        state.close(0.50, 0.45, 100);
+
         assert!(state.try_reserve().is_ok());
     }
 }

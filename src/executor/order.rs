@@ -1,33 +1,31 @@
-use std::{env, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
-use alloy::signers::{
-    local::{LocalSigner, PrivateKeySigner},
-    Signer as _,
-};
-use anyhow::{Context, Result};
-use polymarket_client_sdk_v2::{
-    auth::{state::Authenticated, Credentials, Normal},
-    clob::{
-        types::{response::PostOrderResponse, Amount, OrderType, Side as ClobSide, SignatureType},
-        Client as ClobClient, Config as ClobConfig,
-    },
-    types::{Address, Decimal, U256},
-    POLYGON,
-};
+use polymarket_client_sdk_v2::types::U256;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::config::ExecutionMode;
-use crate::emitter::audit::{AuditBookContext, AuditEmitter, AuditEvent, AuditExitRetryAttempt};
-use crate::engine::state::{round_5, taker_fee_decimal, EngineState};
+use crate::emitter::audit::{AuditEmitter, AuditEvent, AuditExitRetryAttempt};
+use crate::engine::state::{round_5, EngineState};
 use crate::engine::strategy::BtcPriceHistory;
 use crate::health::HealthState;
 use crate::market::{now_ms, ActiveMarket, MarketClock};
-use crate::runtime_config::{StrategySnapshot, StrategyStore};
+use crate::runtime_config::StrategyStore;
 use crate::shadow::{ShadowExitEngine, ShadowExitRequest};
-use crate::ws::polymarket::{BookSnapshot, BookState, DepthSnapshot, OutcomeBook};
+use crate::ws::polymarket::BookState;
 
-const DEFAULT_CLOB_API_URL: &str = "https://clob-v2.polymarket.com";
+use super::audit_context::audit_context;
+use super::errors::{is_balance_not_settled_error, is_no_match_error};
+use super::exit_decision::wait_for_exit_decision;
+use super::math::{
+    buy_notional_spent, buy_shares_filled, decimal_to_f64, floor_to_2_decimals, monotonic_ns,
+    sell_price, sell_shares_filled, ElapsedToNowMs,
+};
+use super::rejection::{reject, reject_with_context};
+pub use super::revalidation::revalidate_entry;
+use super::revalidation::{executable_ask_shares, outcome_book};
+pub use super::{client::LiveExecutor, types::OrderSide, types::OrderSignal};
+
 const LIVE_EXIT_MAX_ATTEMPTS: u32 = 40;
 const LIVE_EXIT_RETRY_MS: u64 = 250;
 const ENTRY_DEPTH_MULTIPLIER: f64 = 1.25;
@@ -40,227 +38,6 @@ const LIVE_ENTRY_GTC_POLLS: u32 = 8;
 const LIVE_ENTRY_GTC_FAST_POLLS: u32 = 2;
 const LIVE_ENTRY_GTC_POLL_MS: u64 = 250;
 const LIVE_EXIT_BALANCE_RETRY_DELAYS_MS: [u64; 4] = [250, 500, 1_000, 2_000];
-
-type AuthenticatedClobClient = ClobClient<Authenticated<Normal>>;
-
-trait ElapsedToNowMs {
-    fn elapsed_to_now_ms(self) -> u64;
-}
-
-impl ElapsedToNowMs for u64 {
-    fn elapsed_to_now_ms(self) -> u64 {
-        now_ms().saturating_sub(self)
-    }
-}
-
-#[derive(Clone)]
-pub struct LiveExecutor {
-    client: AuthenticatedClobClient,
-    signer: PrivateKeySigner,
-    funder_address: Option<String>,
-    signature_type: String,
-}
-
-impl LiveExecutor {
-    pub async fn from_env() -> Result<Self> {
-        let host = env_nonempty("POLYMARKET_CLOB_API_URL")
-            .or_else(|| env_nonempty("CLOB_API_URL"))
-            .unwrap_or_else(|| DEFAULT_CLOB_API_URL.to_owned());
-        let private_key = env_nonempty("POLYMARKET_PRIVATE_KEY")
-            .or_else(|| env_nonempty("POLYGO_PRIVATE_KEY"))
-            .context("POLYMARKET_PRIVATE_KEY is required for live execution")?;
-        let signer = LocalSigner::from_str(&private_key)
-            .context("invalid POLYMARKET_PRIVATE_KEY")?
-            .with_chain_id(Some(POLYGON));
-
-        let mut builder = ClobClient::new(&host, ClobConfig::default())
-            .context("failed to create Polymarket CLOB client")?
-            .authentication_builder(&signer);
-
-        let key = env_nonempty("POLYMARKET_API_KEY").or_else(|| env_nonempty("POLYGO_API_KEY"));
-        let secret =
-            env_nonempty("POLYMARKET_API_SECRET").or_else(|| env_nonempty("POLYGO_API_SECRET"));
-        let passphrase = env_nonempty("POLYMARKET_API_PASSPHRASE")
-            .or_else(|| env_nonempty("POLYGO_API_PASSPHRASE"));
-        if let (Some(key), Some(secret), Some(passphrase)) = (key, secret, passphrase) {
-            builder = builder.credentials(Credentials::new(
-                key.parse().context("invalid POLYMARKET_API_KEY")?,
-                secret,
-                passphrase,
-            ));
-        }
-
-        let funder = env_nonempty("POLYMARKET_FUNDER_ADDRESS")
-            .or_else(|| env_nonempty("POLYMARKET_DEPOSIT_WALLET"))
-            .or_else(|| env_nonempty("DEPOSIT_WALLET"));
-        let signature_type = parse_signature_type(
-            env_nonempty("POLYMARKET_SIGNATURE_TYPE").as_deref(),
-            funder.is_some(),
-        )?;
-        let funder_address = funder.clone();
-        if let Some(funder) = funder {
-            builder = builder.funder(Address::from_str(&funder).context("invalid funder address")?);
-        }
-        let signature_type_label = format!("{signature_type:?}");
-        builder = builder.signature_type(signature_type);
-
-        let client = builder
-            .authenticate()
-            .await
-            .context("Polymarket authentication failed")?;
-        Ok(Self {
-            client,
-            signer,
-            funder_address,
-            signature_type: signature_type_label,
-        })
-    }
-
-    async fn sell_shares(&self, token_id: U256, shares: f64) -> Result<PostOrderResponse> {
-        let sellable_shares = floor_to_2_decimals(shares);
-        let started = std::time::Instant::now();
-        let response = self
-            .client
-            .market_order()
-            .token_id(token_id)
-            .side(ClobSide::Sell)
-            .amount(Amount::shares(decimal_from_f64(sellable_shares)?)?)
-            .order_type(OrderType::FAK)
-            .build_sign_and_post(&self.signer)
-            .await;
-        info!(
-            op = "sell_shares_fak",
-            total_ms = started.elapsed().as_millis() as u64,
-            success = response.as_ref().map(|response| response.success).unwrap_or(false),
-            error = response.is_err(),
-            "Polymarket live HTTP timing"
-        );
-        response.context("Polymarket sell order failed")
-    }
-
-    async fn place_gtc_buy(
-        &self,
-        token_id: U256,
-        shares: u64,
-        limit_price: f64,
-    ) -> Result<TimedPostOrderResponse> {
-        let build_started_ms = now_ms();
-        let order = self
-            .client
-            .limit_order()
-            .token_id(token_id)
-            .side(ClobSide::Buy)
-            .price(decimal_from_f64(limit_price)?)
-            .size(Decimal::from(shares))
-            .order_type(OrderType::GTC)
-            .build()
-            .await
-            .context("Polymarket GTC buy order build failed")?;
-        let build_latency_ms = now_ms().saturating_sub(build_started_ms);
-        let sign_started_ms = now_ms();
-        let signed = self
-            .client
-            .sign(&self.signer, order)
-            .await
-            .context("Polymarket GTC buy order sign failed")?;
-        let sign_latency_ms = now_ms().saturating_sub(sign_started_ms);
-        let post_started_ms = now_ms();
-        let response = self
-            .client
-            .post_order(signed)
-            .await
-            .context("Polymarket GTC buy order post failed")?;
-        let post_latency_ms = now_ms().saturating_sub(post_started_ms);
-        info!(
-            op = "place_gtc_buy",
-            build_ms = build_latency_ms,
-            sign_ms = sign_latency_ms,
-            post_ms = post_latency_ms,
-            total_ms = build_started_ms.elapsed_to_now_ms(),
-            success = response.success,
-            status = %response.status,
-            "Polymarket live HTTP timing"
-        );
-        Ok(TimedPostOrderResponse {
-            response,
-            build_latency_ms,
-            sign_latency_ms,
-            post_latency_ms,
-        })
-    }
-
-    pub async fn warm_market_cache(&self, market: &ActiveMarket) -> Result<()> {
-        self.client
-            .version()
-            .await
-            .context("Polymarket version warm-up failed")?;
-        for token_id_text in [&market.yes_asset_id, &market.no_asset_id] {
-            let token_id = U256::from_str(token_id_text).context("invalid warm-up token id")?;
-            self.client
-                .tick_size(token_id)
-                .await
-                .context("Polymarket tick size warm-up failed")?;
-            self.client
-                .neg_risk(token_id)
-                .await
-                .context("Polymarket neg-risk warm-up failed")?;
-        }
-        Ok(())
-    }
-
-    async fn place_gtc_sell(
-        &self,
-        token_id: U256,
-        shares: f64,
-        limit_price: f64,
-    ) -> Result<PostOrderResponse> {
-        let build_started_ms = now_ms();
-        let order = self
-            .client
-            .limit_order()
-            .token_id(token_id)
-            .side(ClobSide::Sell)
-            .price(decimal_from_f64(limit_price)?)
-            .size(decimal_from_f64(shares)?)
-            .order_type(OrderType::GTC)
-            .build()
-            .await
-            .context("Polymarket GTC sell order build failed")?;
-        let build_latency_ms = now_ms().saturating_sub(build_started_ms);
-        let sign_started_ms = now_ms();
-        let signed = self
-            .client
-            .sign(&self.signer, order)
-            .await
-            .context("Polymarket GTC sell order sign failed")?;
-        let sign_latency_ms = now_ms().saturating_sub(sign_started_ms);
-        let post_started_ms = now_ms();
-        let response = self
-            .client
-            .post_order(signed)
-            .await
-            .context("Polymarket GTC sell order post failed")?;
-        let post_latency_ms = now_ms().saturating_sub(post_started_ms);
-        info!(
-            op = "place_gtc_sell",
-            build_ms = build_latency_ms,
-            sign_ms = sign_latency_ms,
-            post_ms = post_latency_ms,
-            total_ms = build_started_ms.elapsed_to_now_ms(),
-            success = response.success,
-            status = %response.status,
-            "Polymarket live HTTP timing"
-        );
-        Ok(response)
-    }
-}
-
-struct TimedPostOrderResponse {
-    response: PostOrderResponse,
-    build_latency_ms: u64,
-    sign_latency_ms: u64,
-    post_latency_ms: u64,
-}
 
 struct GtcExitResult {
     sold_shares: f64,
@@ -292,54 +69,6 @@ struct GtcEntryResult {
     cancel_confirmed: Option<bool>,
     final_status: Option<String>,
     final_size_matched: Option<f64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderSide {
-    BuyYes,
-    BuyNo,
-}
-
-impl OrderSide {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BuyYes => "BUY_YES",
-            Self::BuyNo => "BUY_NO",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OrderSignal {
-    pub side: OrderSide,
-    pub momentum_usd: f64,
-    pub signal_ts_ms: u64,
-    pub binance_price: f64,
-    pub execute_at: tokio::time::Instant,
-    pub config_generation: u64,
-    pub hold_ms: u64,
-}
-
-impl OrderSignal {
-    pub fn new(
-        side: OrderSide,
-        momentum_usd: f64,
-        signal_ts_ms: u64,
-        binance_price: f64,
-        execute_at: tokio::time::Instant,
-        config_generation: u64,
-        hold_ms: u64,
-    ) -> Self {
-        Self {
-            side,
-            momentum_usd,
-            signal_ts_ms,
-            binance_price,
-            execute_at,
-            config_generation,
-            hold_ms,
-        }
-    }
 }
 
 pub async fn run(
@@ -456,122 +185,6 @@ async fn warm_live_market_cache(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExitDecision {
-    reason: &'static str,
-    decided_at_ms: u64,
-    held_ms: u64,
-    exit_momentum_usd: Option<f64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExitMark {
-    net_pnl: f64,
-    net_pnl_pct: f64,
-}
-
-async fn wait_for_exit_decision(
-    signal: &OrderSignal,
-    entry_at_ms: u64,
-    entry_price: f64,
-    shares: f64,
-    config: &StrategySnapshot,
-    book_state: &BookState,
-    btc_price_history: &BtcPriceHistory,
-) -> ExitDecision {
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_millis(
-            config.exit_check_interval_ms,
-        ))
-        .await;
-        let decided_at_ms = now_ms();
-        let held_ms = decided_at_ms.saturating_sub(entry_at_ms);
-        let book = book_state.load();
-        let mark = exit_mark(
-            book,
-            decided_at_ms,
-            signal.side,
-            entry_price,
-            shares,
-            config,
-        );
-        let exit_momentum_usd = btc_price_history.recent_momentum(config.exit_reversal_window_ms);
-        let is_adverse = adverse_reversal(
-            signal.side,
-            exit_momentum_usd,
-            config.exit_reversal_threshold_usd,
-        );
-
-        if mark
-            .map(|mark| mark.net_pnl_pct <= config.exit_stop_loss_pct)
-            .unwrap_or(false)
-        {
-            return ExitDecision {
-                reason: "stop_loss",
-                decided_at_ms,
-                held_ms,
-                exit_momentum_usd,
-            };
-        }
-        if let Some(mark) = mark.filter(|_| held_ms >= config.exit_min_hold_ms && is_adverse) {
-            return ExitDecision {
-                reason: if mark.net_pnl >= config.exit_take_profit_net_usd {
-                    "profit_reversal"
-                } else {
-                    "momentum_reversal"
-                },
-                decided_at_ms,
-                held_ms,
-                exit_momentum_usd,
-            };
-        }
-        if held_ms >= config.exit_max_hold_ms {
-            return ExitDecision {
-                reason: "max_hold",
-                decided_at_ms,
-                held_ms,
-                exit_momentum_usd,
-            };
-        }
-    }
-}
-
-fn exit_mark(
-    book: BookSnapshot,
-    now_ms: u64,
-    side: OrderSide,
-    entry_price: f64,
-    shares: f64,
-    config: &StrategySnapshot,
-) -> Option<ExitMark> {
-    if now_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms {
-        return None;
-    }
-    let exit_price = outcome_book(book, side).bid?;
-    let gross_pnl = (exit_price - entry_price) * shares;
-    let entry_fee = taker_fee_decimal(shares, entry_price);
-    let exit_fee = taker_fee_decimal(shares, exit_price);
-    let entry_notional = entry_price * shares;
-    if entry_notional <= 0.0 {
-        return None;
-    }
-    let net_pnl = round_5(gross_pnl - entry_fee - exit_fee);
-    Some(ExitMark {
-        net_pnl,
-        net_pnl_pct: round_5((net_pnl / entry_notional) * 100.0),
-    })
-}
-
-fn adverse_reversal(side: OrderSide, momentum_usd: Option<f64>, threshold_usd: f64) -> bool {
-    let Some(momentum_usd) = momentum_usd else {
-        return false;
-    };
-    match side {
-        OrderSide::BuyYes => momentum_usd <= -threshold_usd,
-        OrderSide::BuyNo => momentum_usd >= threshold_usd,
-    }
-}
-
 async fn execute_dry_run(
     signal: OrderSignal,
     book_state: Arc<BookState>,
@@ -583,11 +196,6 @@ async fn execute_dry_run(
     audit: AuditEmitter,
     shadow_exit: ShadowExitEngine,
 ) {
-    info!(
-        side = signal.side.as_str(),
-        signal_ts_ms = signal.signal_ts_ms,
-        "Execution task started"
-    );
     info!(
         side = signal.side.as_str(),
         signal_ts_ms = signal.signal_ts_ms,
@@ -680,7 +288,7 @@ async fn execute_dry_run(
             side: signal.side,
             entry_ms: executed_at_ms,
             decision_ms: exit_at_ms,
-            exit_reason: "max_hold",
+            exit_reason: exit_decision.reason,
             entry_price: ask,
             shares: shares as f64,
             decision_processing_started_ns: processing_ns,
@@ -1017,7 +625,7 @@ async fn execute_live(
             side: signal.side,
             entry_ms: confirmed_at_ms,
             decision_ms: exit_at_ms,
-            exit_reason: "max_hold",
+            exit_reason: exit_decision.reason,
             entry_price,
             shares: sellable_shares,
             decision_processing_started_ns: processing_ns,
@@ -1349,8 +957,8 @@ async fn buy_with_gtc_limit(
         result.poll_status = Some(order.status.to_string());
         result.poll_size_matched = Some(matched);
         if matched > result.filled_shares {
+            result.notional_usd += (matched - result.filled_shares) * limit_price;
             result.filled_shares = matched;
-            result.notional_usd = matched * limit_price;
         }
         result.order_status = Some(order.status.to_string());
         if result.filled_shares + 0.00001 >= target_shares {
@@ -1415,8 +1023,8 @@ async fn buy_with_gtc_limit(
     result.final_status = Some(final_order.status.to_string());
     result.final_size_matched = Some(matched);
     if matched > result.filled_shares {
+        result.notional_usd += (matched - result.filled_shares) * limit_price;
         result.filled_shares = matched;
-        result.notional_usd = matched * limit_price;
     }
     result.order_status = Some(final_order.status.to_string());
     if !cancellation_confirmed && result.filled_shares + 0.00001 < target_shares {
@@ -1601,259 +1209,4 @@ async fn sell_with_gtc_fallback(
     }
 
     result
-}
-
-#[inline]
-pub fn revalidate_entry(
-    book: BookSnapshot,
-    now_ms: u64,
-    market_clock: &MarketClock,
-    config: &StrategySnapshot,
-    side: OrderSide,
-) -> Option<(f64, u64)> {
-    if !market_clock.progress_allowed(now_ms, config.min_progress, config.max_progress)
-        || now_ms.saturating_sub(book.received_at_ms) > config.max_book_age_ms
-    {
-        return None;
-    }
-    let outcome = outcome_book(book, side);
-    let (Some(bid), Some(ask)) = (outcome.bid, outcome.ask) else {
-        return None;
-    };
-    if ask <= bid || ask - bid > config.max_spread + 0.00001 {
-        return None;
-    }
-    if ask < config.min_price || ask > config.max_price {
-        return None;
-    }
-    let shares = order_size(ask, config.max_notional_usd, config.max_shares);
-    if !expected_move_covers_fees(ask, shares, config.min_expected_price_move) {
-        return None;
-    }
-    (shares > 0).then_some((ask, shares))
-}
-
-fn reject(
-    signal: OrderSignal,
-    reason: &'static str,
-    engine_state: &EngineState,
-    audit: &AuditEmitter,
-) {
-    engine_state.release_reservation();
-    info!(
-        signal_ts_ms = signal.signal_ts_ms,
-        side = signal.side.as_str(),
-        reason,
-        "Execution rejected"
-    );
-    let _ = audit.emit(AuditEvent::ExecutionRejected {
-        signal_ts_ms: signal.signal_ts_ms,
-        side: signal.side.as_str(),
-        reason,
-        context: None,
-    });
-}
-
-fn reject_with_context(
-    signal: OrderSignal,
-    reason: &'static str,
-    engine_state: &EngineState,
-    audit: &AuditEmitter,
-    context: Option<AuditBookContext>,
-) {
-    engine_state.release_reservation();
-    info!(
-        signal_ts_ms = signal.signal_ts_ms,
-        side = signal.side.as_str(),
-        reason,
-        "Execution rejected"
-    );
-    let _ = audit.emit(AuditEvent::ExecutionRejected {
-        signal_ts_ms: signal.signal_ts_ms,
-        side: signal.side.as_str(),
-        reason,
-        context,
-    });
-}
-
-fn audit_context(
-    book: BookSnapshot,
-    now_ms: u64,
-    side: OrderSide,
-    market: Option<&ActiveMarket>,
-    entry_slippage: Option<f64>,
-    entry_limit_price: Option<f64>,
-    intended_shares: Option<u64>,
-) -> AuditBookContext {
-    let selected = outcome_book(book, side);
-    let token_id = market.map(|market| match side {
-        OrderSide::BuyYes => market.yes_asset_id.clone(),
-        OrderSide::BuyNo => market.no_asset_id.clone(),
-    });
-    let intended_notional_usd = intended_shares.map(|shares| {
-        round_5(shares as f64 * entry_limit_price.or(selected.ask).unwrap_or_default())
-    });
-
-    AuditBookContext {
-        market_slug: market.map(|market| market.slug.clone()),
-        token_id,
-        yes_bid: book.yes.bid.map(round_5),
-        yes_ask: book.yes.ask.map(round_5),
-        no_bid: book.no.bid.map(round_5),
-        no_ask: book.no.ask.map(round_5),
-        book_received_at_ms: book.received_at_ms,
-        book_source_ts_ms: book.source_ts_ms,
-        book_age_ms: now_ms.saturating_sub(book.received_at_ms),
-        selected_bid: selected.bid.map(round_5),
-        selected_ask: selected.ask.map(round_5),
-        entry_slippage: entry_slippage.map(round_5),
-        entry_limit_price: entry_limit_price.map(round_5),
-        intended_shares,
-        intended_notional_usd,
-        available_shares: None,
-        required_shares: None,
-        exchange_error: None,
-        filled_shares: None,
-        exit_attempts: None,
-        exit_retry_attempts: None,
-        exit_attempt_funder_address: None,
-        entry_matched_funder_address: None,
-        signature_type: None,
-        fallback_order_id: None,
-        entry_submit_latency_ms: None,
-        entry_build_latency_ms: None,
-        entry_sign_latency_ms: None,
-        entry_post_latency_ms: None,
-        gtc_post_success: None,
-        gtc_post_status: None,
-        gtc_post_making_amount: None,
-        gtc_post_taking_amount: None,
-        gtc_poll_count: None,
-        gtc_poll_status: None,
-        gtc_poll_size_matched: None,
-        gtc_cancel_confirmed: None,
-        gtc_final_status: None,
-        gtc_final_size_matched: None,
-    }
-}
-
-fn executable_ask_shares(depth: &DepthSnapshot, side: OrderSide, limit_price: f64) -> f64 {
-    let asks = match side {
-        OrderSide::BuyYes => &depth.yes.asks,
-        OrderSide::BuyNo => &depth.no.asks,
-    };
-    asks.iter()
-        .filter(|level| level.price <= limit_price)
-        .map(|level| level.size)
-        .sum()
-}
-
-fn is_no_match_error(error: &str) -> bool {
-    error.contains("no orders found to match with FAK order")
-}
-
-fn is_balance_not_settled_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("not enough balance / allowance")
-        || (error.contains("balance: 0") && error.contains("order amount"))
-        || (error.contains("balance is not enough") && error.contains("allowance"))
-}
-
-fn outcome_book(snapshot: BookSnapshot, side: OrderSide) -> OutcomeBook {
-    match side {
-        OrderSide::BuyYes => snapshot.yes,
-        OrderSide::BuyNo => snapshot.no,
-    }
-}
-
-fn order_size(price: f64, max_notional_usd: f64, max_shares: u64) -> u64 {
-    if !(0.0..=1.0).contains(&price) || price == 0.0 {
-        return 0;
-    }
-    ((max_notional_usd / price).floor() as u64).min(max_shares)
-}
-
-fn expected_move_covers_fees(entry_price: f64, shares: u64, min_expected_price_move: f64) -> bool {
-    if shares == 0 {
-        return false;
-    }
-    if min_expected_price_move <= 0.0 {
-        return true;
-    }
-    let exit_price = (entry_price + min_expected_price_move).min(1.0);
-    let gross = min_expected_price_move * shares as f64;
-    let fees = fee(entry_price, shares) + fee(exit_price, shares);
-    gross > fees
-}
-
-fn fee(price: f64, shares: u64) -> f64 {
-    shares as f64 * 0.07 * price * (1.0 - price)
-}
-
-fn sell_price(response: &PostOrderResponse) -> Option<f64> {
-    price_ratio(response.taking_amount, response.making_amount)
-}
-
-fn sell_shares_filled(response: &PostOrderResponse) -> Option<f64> {
-    decimal_to_f64(response.making_amount)
-}
-
-fn buy_shares_filled(response: &PostOrderResponse) -> Option<f64> {
-    decimal_to_f64(response.taking_amount)
-}
-
-fn buy_notional_spent(response: &PostOrderResponse) -> Option<f64> {
-    decimal_to_f64(response.making_amount)
-}
-
-fn price_ratio(numerator: Decimal, denominator: Decimal) -> Option<f64> {
-    let denominator = decimal_to_f64(denominator)?;
-    if denominator <= 0.0 {
-        return None;
-    }
-    Some(decimal_to_f64(numerator)? / denominator)
-}
-
-fn decimal_from_f64(value: f64) -> Result<Decimal> {
-    Decimal::from_str(&round_5(value).to_string()).context("invalid decimal amount")
-}
-
-fn floor_to_2_decimals(value: f64) -> f64 {
-    (value * 100.0).floor() / 100.0
-}
-
-fn decimal_to_f64(value: Decimal) -> Option<f64> {
-    value.to_string().parse().ok()
-}
-
-fn env_nonempty(key: &str) -> Option<String> {
-    env::var(key).ok().filter(|value| !value.trim().is_empty())
-}
-
-fn monotonic_ns() -> u128 {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_nanos()
-}
-
-fn parse_signature_type(value: Option<&str>, has_funder: bool) -> Result<SignatureType> {
-    let value = value.unwrap_or(if has_funder { "3" } else { "0" });
-    match value {
-        "0" | "EOA" | "eoa" => Ok(SignatureType::Eoa),
-        "1" | "PROXY" | "proxy" => Ok(SignatureType::Proxy),
-        "2" | "GNOSIS_SAFE" | "gnosis_safe" => Ok(SignatureType::GnosisSafe),
-        "3" | "POLY1271" | "poly1271" => Ok(SignatureType::Poly1271),
-        _ => anyhow::bail!("invalid POLYMARKET_SIGNATURE_TYPE"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sizes_with_notional_and_share_caps() {
-        assert_eq!(order_size(0.50, 100.0, 500), 200);
-        assert_eq!(order_size(0.10, 100.0, 500), 500);
-        assert_eq!(order_size(0.0, 100.0, 500), 0);
-    }
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, protocol::Message},
@@ -50,7 +50,23 @@ pub struct DepthSnapshot {
     pub source_ts_ms: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TradeSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TradePrint {
+    pub is_yes: bool,
+    pub side: TradeSide,
+    pub price: f64,
+    pub size: f64,
+    pub received_at_ms: u64,
+    pub source_ts_ms: u64,
+}
+
+#[derive(Debug)]
 pub struct BookState {
     sequence: AtomicU64,
     yes_bid: AtomicU64,
@@ -60,6 +76,24 @@ pub struct BookState {
     received_at_ms: AtomicU64,
     source_ts_ms: AtomicU64,
     depth: RwLock<DepthSnapshot>,
+    trades: broadcast::Sender<TradePrint>,
+}
+
+impl Default for BookState {
+    fn default() -> Self {
+        let (trades, _) = broadcast::channel(2_048);
+        Self {
+            sequence: AtomicU64::new(0),
+            yes_bid: AtomicU64::new(f64::NAN.to_bits()),
+            yes_ask: AtomicU64::new(f64::NAN.to_bits()),
+            no_bid: AtomicU64::new(f64::NAN.to_bits()),
+            no_ask: AtomicU64::new(f64::NAN.to_bits()),
+            received_at_ms: AtomicU64::new(0),
+            source_ts_ms: AtomicU64::new(0),
+            depth: RwLock::new(DepthSnapshot::default()),
+            trades,
+        }
+    }
 }
 
 impl BookState {
@@ -120,6 +154,14 @@ impl BookState {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+
+    pub fn subscribe_trades(&self) -> broadcast::Receiver<TradePrint> {
+        self.trades.subscribe()
+    }
+
+    fn publish_trade(&self, trade: TradePrint) {
+        let _ = self.trades.send(trade);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +182,19 @@ enum MarketEvent<'a> {
     PriceChange {
         #[serde(borrow)]
         price_changes: Vec<PriceChange<'a>>,
+        #[serde(default, borrow)]
+        timestamp: Option<WireU64<'a>>,
+    },
+    #[serde(rename = "last_trade_price")]
+    LastTradePrice {
+        #[serde(borrow)]
+        asset_id: &'a str,
+        #[serde(borrow)]
+        price: &'a str,
+        #[serde(default, borrow)]
+        side: Option<&'a str>,
+        #[serde(default, borrow)]
+        size: Option<&'a str>,
         #[serde(default, borrow)]
         timestamp: Option<WireU64<'a>>,
     },
@@ -240,6 +295,8 @@ pub async fn run(
                                 &market.no_asset_id,
                                 &mut snapshot,
                                 &mut depth,
+                                &book_state,
+                                received_at_ms,
                             ) {
                                 Ok(true) => {
                                     snapshot.received_at_ms = received_at_ms;
@@ -282,7 +339,7 @@ pub fn parse_and_apply(
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
 ) -> Result<bool> {
-    parse_and_apply_inner(raw, yes_asset_id, no_asset_id, snapshot, None)
+    parse_and_apply_inner(raw, yes_asset_id, no_asset_id, snapshot, None, None)
 }
 
 fn parse_and_apply_with_depth(
@@ -291,8 +348,17 @@ fn parse_and_apply_with_depth(
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
     depth: &mut DepthSnapshot,
+    book_state: &BookState,
+    received_at_ms: u64,
 ) -> Result<bool> {
-    parse_and_apply_inner(raw, yes_asset_id, no_asset_id, snapshot, Some(depth))
+    parse_and_apply_inner(
+        raw,
+        yes_asset_id,
+        no_asset_id,
+        snapshot,
+        Some(depth),
+        Some((book_state, received_at_ms)),
+    )
 }
 
 fn parse_and_apply_inner(
@@ -301,6 +367,7 @@ fn parse_and_apply_inner(
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
     mut depth: Option<&mut DepthSnapshot>,
+    trade_sink: Option<(&BookState, u64)>,
 ) -> Result<bool> {
     let mut changed = false;
     if raw.as_bytes().first() == Some(&b'[') {
@@ -312,11 +379,19 @@ fn parse_and_apply_inner(
                 no_asset_id,
                 snapshot,
                 depth.as_deref_mut(),
+                trade_sink,
             );
         }
     } else {
         let event: MarketEvent<'_> = serde_json::from_str(raw)?;
-        changed = apply_event(event, yes_asset_id, no_asset_id, snapshot, depth);
+        changed = apply_event(
+            event,
+            yes_asset_id,
+            no_asset_id,
+            snapshot,
+            depth,
+            trade_sink,
+        );
     }
     Ok(changed)
 }
@@ -327,6 +402,7 @@ fn apply_event(
     no_asset_id: &str,
     snapshot: &mut BookSnapshot,
     mut depth: Option<&mut DepthSnapshot>,
+    trade_sink: Option<(&BookState, u64)>,
 ) -> bool {
     match event {
         MarketEvent::Book {
@@ -404,6 +480,40 @@ fn apply_event(
                 snapshot.source_ts_ms = timestamp;
             }
             changed
+        }
+        MarketEvent::LastTradePrice {
+            asset_id,
+            price,
+            side,
+            size,
+            timestamp,
+        } => {
+            let is_yes = if asset_id == yes_asset_id {
+                true
+            } else if asset_id == no_asset_id {
+                false
+            } else {
+                return false;
+            };
+            let Some((book_state, received_at_ms)) = trade_sink else {
+                return false;
+            };
+            let (Some(price), Some(size), Some(side)) = (
+                parse_price(price),
+                size.and_then(parse_size),
+                side.and_then(parse_trade_side),
+            ) else {
+                return false;
+            };
+            book_state.publish_trade(TradePrint {
+                is_yes,
+                side,
+                price,
+                size,
+                received_at_ms,
+                source_ts_ms: timestamp.and_then(|value| value.get()).unwrap_or_default(),
+            });
+            false
         }
         MarketEvent::Other => false,
     }
@@ -488,6 +598,16 @@ fn parse_size(value: &str) -> Option<f64> {
     value.parse().ok().filter(|size| *size >= 0.0)
 }
 
+fn parse_trade_side(value: &str) -> Option<TradeSide> {
+    if value.eq_ignore_ascii_case("BUY") {
+        Some(TradeSide::Buy)
+    } else if value.eq_ignore_ascii_case("SELL") {
+        Some(TradeSide::Sell)
+    } else {
+        None
+    }
+}
+
 fn option_to_bits(value: Option<f64>) -> u64 {
     value.unwrap_or(f64::NAN).to_bits()
 }
@@ -540,5 +660,36 @@ mod tests {
         };
         state.store(snapshot);
         assert_eq!(state.load(), snapshot);
+    }
+
+    #[test]
+    fn publishes_last_trade_for_shadow_fill_tracking() {
+        let state = BookState::default();
+        let mut trades = state.subscribe_trades();
+        let mut snapshot = BookSnapshot::default();
+        let mut depth = DepthSnapshot::default();
+        let payload = r#"{"event_type":"last_trade_price","asset_id":"yes","price":"0.55","side":"BUY","size":"7.5","timestamp":"1000"}"#;
+
+        assert!(!parse_and_apply_with_depth(
+            payload,
+            "yes",
+            "no",
+            &mut snapshot,
+            &mut depth,
+            &state,
+            1_001,
+        )
+        .unwrap());
+        assert_eq!(
+            trades.try_recv().unwrap(),
+            TradePrint {
+                is_yes: true,
+                side: TradeSide::Buy,
+                price: 0.55,
+                size: 7.5,
+                received_at_ms: 1_001,
+                source_ts_ms: 1_000,
+            }
+        );
     }
 }

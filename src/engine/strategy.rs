@@ -63,6 +63,7 @@ pub trait Strategy: Send {
 
 pub struct MomentumStrategy {
     window_ms: u64,
+    momentum_threshold_usd: f64,
     buy_yes_threshold_usd: f64,
     buy_no_threshold_usd: f64,
     prices: VecDeque<PriceTick>,
@@ -72,6 +73,7 @@ impl MomentumStrategy {
     pub fn new(config: &StrategyConfig) -> Self {
         Self::with_params(
             config.momentum_window_ms,
+            config.momentum_threshold_usd,
             config.buy_yes_momentum_threshold_usd,
             config.buy_no_momentum_threshold_usd,
         )
@@ -79,11 +81,13 @@ impl MomentumStrategy {
 
     pub fn with_params(
         window_ms: u64,
+        momentum_threshold_usd: f64,
         buy_yes_threshold_usd: f64,
         buy_no_threshold_usd: f64,
     ) -> Self {
         Self {
             window_ms,
+            momentum_threshold_usd,
             buy_yes_threshold_usd,
             buy_no_threshold_usd,
             prices: VecDeque::with_capacity(512),
@@ -110,10 +114,11 @@ impl Strategy for MomentumStrategy {
         } else {
             OrderSide::BuyNo
         };
-        let threshold_usd = match side {
+        let side_threshold_usd = match side {
             OrderSide::BuyYes => self.buy_yes_threshold_usd,
             OrderSide::BuyNo => self.buy_no_threshold_usd,
         };
+        let threshold_usd = self.momentum_threshold_usd.max(side_threshold_usd);
         if momentum_usd.abs() < threshold_usd {
             return None;
         }
@@ -187,6 +192,23 @@ mod tests {
         assert_eq!(
             strategy.on_binance_tick(PriceTick::new(120.0, 1_099), 1_100),
             None
+        );
+    }
+
+    #[test]
+    fn general_threshold_is_a_floor_for_side_thresholds() {
+        let mut strategy = MomentumStrategy::with_params(100, 15.0, 12.0, 8.0);
+        strategy.on_binance_tick(PriceTick::new(100.0, 1_000), 1_000);
+        assert_eq!(
+            strategy.on_binance_tick(PriceTick::new(114.0, 1_100), 1_100),
+            None
+        );
+        assert_eq!(
+            strategy
+                .on_binance_tick(PriceTick::new(115.0, 1_101), 1_101)
+                .unwrap()
+                .side,
+            OrderSide::BuyYes
         );
     }
 

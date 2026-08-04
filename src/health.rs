@@ -113,6 +113,7 @@ impl HealthState {
                 1 => "audit_backpressure",
                 2 => "binance_backpressure",
                 3 => "execution_backpressure",
+                5 => "position_open_manual_intervention",
                 _ => "none",
             },
             live_execution_enabled: false,

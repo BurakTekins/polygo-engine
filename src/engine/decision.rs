@@ -36,6 +36,7 @@ pub async fn run(
         if config.generation != strategy_generation {
             strategy = Some(MomentumStrategy::with_params(
                 config.momentum_window_ms,
+                config.momentum_threshold_usd,
                 config.buy_yes_momentum_threshold_usd,
                 config.buy_no_momentum_threshold_usd,
             ));
