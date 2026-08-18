@@ -332,6 +332,45 @@ mod tests {
         ControlConfig, ExecutionMode, IntegrationConfig, MarketConfig, RiskConfig, StrategyConfig,
     };
 
+    async fn parse_wire_request(bytes: &[u8]) -> Result<HttpRequest> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let parser = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            read_request(&mut stream).await
+        });
+        let mut client = TcpStream::connect(address).await?;
+        client.write_all(bytes).await?;
+        client.shutdown().await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), parser).await??
+    }
+
+    #[tokio::test]
+    async fn rejects_body_larger_than_control_request_limit() {
+        let error = parse_wire_request(
+            b"PUT /v1/config HTTP/1.1\r\nContent-Length: 16384\r\n\r\n",
+        ).await.err().expect("oversized body must be rejected");
+        assert_eq!(error.to_string(), "request body too large");
+    }
+
+    #[tokio::test]
+    async fn rejects_connection_closed_before_declared_body_completes() {
+        let error = parse_wire_request(
+            b"POST /v1/control/stop HTTP/1.1\r\nContent-Length: 100\r\n\r\n{}",
+        ).await.err().expect("truncated body must be rejected");
+        assert_eq!(error.to_string(), "connection closed before body completed");
+    }
+
+    #[tokio::test]
+    async fn reads_body_using_case_insensitive_content_length() {
+        let request = parse_wire_request(
+            b"POST /v1/control/stop HTTP/1.1\r\ncontent-length: 2\r\n\r\n{}",
+        ).await.unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/control/stop");
+        assert_eq!(request.body, b"{}");
+    }
+
     #[tokio::test]
     async fn java_v1_contract_controls_engine_state() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

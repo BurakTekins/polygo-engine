@@ -1,0 +1,27 @@
+name: Automated tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable on 2026-10-31
+        with:
+          toolchain: 1.99.1
+      - name: Run all targets and features
+        run: cargo test --locked --all-targets --all-features
+      - name: Run documentation tests
+        run: cargo test --locked --doc --all-features
