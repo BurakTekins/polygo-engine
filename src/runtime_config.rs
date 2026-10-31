@@ -409,6 +409,22 @@ mod tests {
         assert!(store.version_matches("momentum-v1"));
     }
 
+    #[test]
+    fn invalid_strategy_limits_are_rejected() {
+        let mut config = fixture();
+        config.max_notional_usd = 0.0;
+        assert!(config.validate().is_err());
+        let mut config = fixture();
+        config.min_progress = config.max_progress + 0.1;
+        assert!(config.validate().is_err());
+        let mut config = fixture();
+        config.exit_min_hold_ms = config.exit_max_hold_ms + 1;
+        assert!(config.validate().is_err());
+        let mut config = fixture();
+        config.momentum_threshold_usd = f64::NAN;
+        assert!(config.validate().is_err());
+    }
+
     fn fixture() -> JavaStrategyConfig {
         JavaStrategyConfig {
             config_version: "momentum-v1".into(),
